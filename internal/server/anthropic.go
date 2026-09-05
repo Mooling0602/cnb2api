@@ -17,14 +17,15 @@ import (
 
 // anthropicRequest 是 Anthropic Messages 请求格式（子集）。
 type anthropicRequest struct {
-	Model      string          `json:"model"`
-	MaxTokens  int             `json:"max_tokens"`
-	System     json.RawMessage `json:"system"` // string 或 [{type:text,...}]
-	Messages   []anthropicMsg  `json:"messages"`
-	Tools      []anthropicTool `json:"tools"`
-	Stream     bool            `json:"stream"`
-	Temperature *float64       `json:"temperature"`
-	TopP        *float64       `json:"top_p"`
+	Model       string          `json:"model"`
+	MaxTokens   int             `json:"max_tokens"`
+	System      json.RawMessage `json:"system"` // string 或 [{type:text,...}]
+	Messages    []anthropicMsg  `json:"messages"`
+	Tools       []anthropicTool `json:"tools"`
+	Stream      bool            `json:"stream"`
+	Temperature *float64        `json:"temperature"`
+	TopP        *float64        `json:"top_p"`
+	Reasoning   json.RawMessage `json:"thinking"` // Anthropic thinking: {type:"enabled",budget_tokens:N}
 }
 
 type anthropicMsg struct {
@@ -77,6 +78,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	if req.TopP != nil {
 		upReq.TopP = req.TopP
+	}
+	if len(req.Reasoning) > 0 {
+		re := extractThinkingEffort(req.Reasoning)
+		if re != nil {
+			upReq.ReasoningEffort = re
+			enableThinking := true
+			upReq.EnableThinking = &enableThinking
+		}
 	}
 
 	// system 字段 → system message
@@ -322,4 +331,32 @@ func (s *Server) anthropicEvent(w http.ResponseWriter, flusher http.Flusher, v m
 	w.Write([]byte("event: " + v["type"].(string) + "\n"))
 	w.Write([]byte("data: " + string(data) + "\n\n"))
 	flusher.Flush()
+}
+
+// extractThinkingEffort 从 Anthropic thinking 参数推断 reasoning effort。
+func extractThinkingEffort(raw json.RawMessage) *string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj struct {
+		Type         string `json:"type"`
+		BudgetTokens int    `json:"budget_tokens"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	if obj.Type != "enabled" {
+		return nil
+	}
+	switch {
+	case obj.BudgetTokens <= 1000:
+		s := "low"
+		return &s
+	case obj.BudgetTokens <= 10000:
+		s := "medium"
+		return &s
+	default:
+		s := "high"
+		return &s
+	}
 }

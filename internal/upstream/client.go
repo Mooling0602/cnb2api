@@ -35,22 +35,23 @@ import (
 )
 
 const (
-	chatURL    = "https://cnb.cool/ai/chat/completions"
-	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+	chatURL   = "https://cnb.cool/ai/chat/completions"
+	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
 // ChatRequest 是 CNB chat/completions 的请求体（OpenAI 兼容超集）。
 type ChatRequest struct {
-	Model           string         `json:"model"`
-	Stream          bool           `json:"stream"`
-	Messages        []ChatMessage  `json:"messages"`
-	Tools           []Tool         `json:"tools,omitempty"`
-	ToolChoice      any            `json:"tool_choice,omitempty"`
-	MaxTokens       int            `json:"maxTokens,omitempty"`
-	EnableThinking  *bool          `json:"enable_thinking,omitempty"`
-	PresencePenalty *float64       `json:"presence_penalty,omitempty"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	TopP            *float64       `json:"top_p,omitempty"`
+	Model           string        `json:"model"`
+	Stream          bool          `json:"stream"`
+	Messages        []ChatMessage `json:"messages"`
+	Tools           []Tool        `json:"tools,omitempty"`
+	ToolChoice      any           `json:"tool_choice,omitempty"`
+	MaxTokens       int           `json:"maxTokens,omitempty"`
+	ReasoningEffort *string       `json:"reasoning_effort,omitempty"`
+	EnableThinking  *bool         `json:"enable_thinking,omitempty"`
+	PresencePenalty *float64      `json:"presence_penalty,omitempty"`
+	Temperature     *float64      `json:"temperature,omitempty"`
+	TopP            *float64      `json:"top_p,omitempty"`
 }
 
 // ChatMessage 是聊天消息。
@@ -61,8 +62,8 @@ type ChatMessage struct {
 
 // Tool 是函数工具定义。
 type Tool struct {
-	Type     string         `json:"type"`
-	Function ToolFunction   `json:"function"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
 }
 
 // ToolFunction 是工具函数定义。
@@ -87,7 +88,7 @@ type Client struct {
 // NewClient 创建上游客户端。
 func NewClient(pool *auth.Pool, timeout time.Duration) *Client {
 	return &Client{
-		hc: &http.Client{Timeout: timeout},
+		hc:       &http.Client{Timeout: timeout},
 		csrfPool: pool,
 	}
 }

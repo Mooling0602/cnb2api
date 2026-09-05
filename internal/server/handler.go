@@ -99,13 +99,14 @@ func (s *Server) resolveModel(reqModel string) string {
 
 // chatRequest 是收到的 OpenAI 格式请求。
 type chatRequest struct {
-	Model       string            `json:"model"`
-	Stream      bool              `json:"stream"`
-	Messages    []chatMsg         `json:"messages"`
-	MaxTokens   int               `json:"max_tokens"`
-	Tools       []json.RawMessage `json:"tools"`
-	Temperature *float64          `json:"temperature"`
-	TopP        *float64          `json:"top_p"`
+	Model           string            `json:"model"`
+	Stream          bool              `json:"stream"`
+	Messages        []chatMsg         `json:"messages"`
+	MaxTokens       int               `json:"max_tokens"`
+	Tools           []json.RawMessage `json:"tools"`
+	Temperature     *float64          `json:"temperature"`
+	TopP            *float64          `json:"top_p"`
+	ReasoningEffort *string           `json:"reasoning_effort"`
 }
 
 type chatMsg struct {
@@ -218,6 +219,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TopP != nil {
 		upReq.TopP = req.TopP
+	}
+	if req.ReasoningEffort != nil {
+		upReq.ReasoningEffort = req.ReasoningEffort
 	}
 
 	// 消息转换:openclaw 自定义格式 → 上游可接受的 user/assistant 序列

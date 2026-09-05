@@ -16,12 +16,12 @@ import (
 
 // responsesRequest 是 OpenAI Responses 格式请求。
 type responsesRequest struct {
-	Model       string          `json:"model"`
-	Input       json.RawMessage `json:"input"` // string 或 [message objects]
-	Instructions string        `json:"instructions"`
-	Tools       json.RawMessage `json:"tools"` // 保留字段但不使用
-	Stream      bool           `json:"stream"`
-	Reasoning   bool           `json:"reasoning"` // 启用思考
+	Model        string          `json:"model"`
+	Input        json.RawMessage `json:"input"` // string 或 [message objects]
+	Instructions string          `json:"instructions"`
+	Tools        json.RawMessage `json:"tools"` // 保留字段但不使用
+	Stream       bool            `json:"stream"`
+	Reasoning    json.RawMessage `json:"reasoning"` // 可选: bool 或 {effort:"low"|"medium"|"high"}
 }
 
 // handleResponses 处理 POST /v1/responses。
@@ -49,9 +49,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// 转换为内部格式
 	upReq := &upstream.ChatRequest{
-		Model:     s.model,
-		Stream:    true, // 内部统一用流式
-		Messages:  []upstream.ChatMessage{},
+		Model:    s.model,
+		Stream:   true, // 内部统一用流式
+		Messages: []upstream.ChatMessage{},
+	}
+
+	// reasoning → 推理等级/思考模式
+	if len(req.Reasoning) > 0 {
+		reasoningEffort := extractResponsesReasoning(req.Reasoning)
+		if reasoningEffort != "" {
+			upReq.ReasoningEffort = &reasoningEffort
+		}
+		enableThinking := true
+		upReq.EnableThinking = &enableThinking
 	}
 
 	// instructions → system message
@@ -140,11 +150,11 @@ func (s *Server) responsesNonStreamResponse(w http.ResponseWriter, resp *http.Re
 
 	respID := "resp_" + shortID(24)
 	respObj := map[string]any{
-		"id":      respID,
-		"object":  "response",
+		"id":         respID,
+		"object":     "response",
 		"created_at": time.Now().Unix(),
-		"model":   s.model,
-		"status":  "completed",
+		"model":      s.model,
+		"status":     "completed",
 		"output": []map[string]any{
 			{
 				"type":    "message",
@@ -181,7 +191,7 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 
 	// response.created 事件
 	created := map[string]any{
-		"type":     "response.created",
+		"type": "response.created",
 		"response": map[string]any{
 			"id":     respID,
 			"object": "response",
@@ -232,11 +242,11 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 	completed := map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
-			"id":       respID,
-			"object":   "response",
+			"id":         respID,
+			"object":     "response",
 			"created_at": time.Now().Unix(),
-			"model":    s.model,
-			"status":   "completed",
+			"model":      s.model,
+			"status":     "completed",
 			"output": []map[string]any{
 				{
 					"type":    "message",
@@ -266,4 +276,28 @@ func (s *Server) responsesEvent(w http.ResponseWriter, flusher http.Flusher, eve
 	data, _ := json.Marshal(v)
 	w.Write([]byte("data: " + string(data) + "\n\n"))
 	flusher.Flush()
+}
+
+// extractResponsesReasoning 从 Responses API reasoning 参数提取 effort。
+// reasoning 可以是 bool(true) 或对象 {effort:"low"|"medium"|"high"}。
+func extractResponsesReasoning(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	// 尝试 bool
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		if b {
+			return "high"
+		}
+		return ""
+	}
+	// 尝试对象 {effort: "..."}
+	var obj struct {
+		Effort string `json:"effort"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Effort != "" {
+		return obj.Effort
+	}
+	return ""
 }
