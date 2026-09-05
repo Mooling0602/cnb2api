@@ -5,6 +5,7 @@
 # 配置（含敏感 key）
 config.json
 config.local.json
+toolforge-config.yaml
 
 # 凭证/数据
 auths/
