@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 
+	"cnb2api/internal/toolconv"
 	"cnb2api/internal/upstream"
 )
 
@@ -33,11 +34,7 @@ type anthropicMsg struct {
 	Content json.RawMessage `json:"content"` // string 或 [blocks]
 }
 
-type anthropicTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema json.RawMessage `json:"input_schema"`
-}
+type anthropicTool = toolconv.AnthropicTool
 
 // handleAnthropicMessages 处理 POST /v1/messages。
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +83,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			enableThinking := true
 			upReq.EnableThinking = &enableThinking
 		}
+	} else {
+		// 默认思考:客户端未传 thinking 时,默认 low(最轻量)。
+		effort := "low"
+		upReq.ReasoningEffort = &effort
 	}
 
 	// system 字段 → system message
@@ -95,18 +96,54 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// 工具定义：不支持（纯文本透传），忽略 tools 参数
+	// 工具定义:统一提取 + 加 cnb_ 前缀(上游白名单要求),响应时还原,客户端无感。
+	renamer := toolconv.NewRenamer()
+	upReq.Tools = toolconv.ToUpstream(toolconv.FromAnthropic(req.Tools), renamer)
 
-	// messages：Anthropic content 可能是 string 或 blocks
+	// messages:Anthropic content 可能是 string 或 blocks。
+	// 工具历史归一化(借鉴 new-api):assistant 的 tool_use → tool_calls,
+	// user 的 tool_result → tool 消息 + tool_call_id(上游要求配对)。
 	for _, m := range req.Messages {
-		content := extractAnthropicText(m.Content)
-		role := m.Role
-		if role == "assistant" && strings.HasPrefix(content, "<tool_use") {
-			// Anthropic tool_result / tool_use 历史：简化转为文本
-			content = m.Role + ": " + content
-			role = "assistant"
+		blocks, isBlocks := toolconv.ParseAnthropicContent(m.Content)
+		if !isBlocks {
+			// 纯字符串内容
+			upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: m.Role, Content: extractAnthropicText(m.Content)})
+			continue
 		}
-		upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: role, Content: content})
+		switch m.Role {
+		case "assistant":
+			calls, text := toolconv.AnthropicCalls(blocks)
+			if len(calls) > 0 {
+				upCalls := make([]upstream.ToolCall, 0, len(calls))
+				for _, c := range calls {
+					upCalls = append(upCalls, upstream.ToolCall{
+						ID:   c.ID,
+						Type: "function",
+						Function: upstream.ToolCallFunction{
+							Name:      renamer.Forward(c.Name),
+							Arguments: c.Arguments,
+						},
+					})
+				}
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text, ToolCalls: upCalls})
+			} else {
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text})
+			}
+		case "user":
+			results, text := toolconv.AnthropicResults(blocks)
+			if len(results) > 0 {
+				for _, res := range results {
+					upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "tool", Content: res.Content, ToolCallID: res.CallID})
+				}
+				if text != "" {
+					upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text})
+				}
+			} else {
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text})
+			}
+		default:
+			upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: m.Role, Content: extractAnthropicText(m.Content)})
+		}
 	}
 
 	ctx := r.Context()
@@ -118,9 +155,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	defer resp.Body.Close()
 
 	if req.Stream {
-		s.anthropicStreamResponse(w, resp)
+		s.anthropicStreamResponse(w, resp, renamer)
 	} else {
-		s.anthropicNonStreamResponse(w, resp)
+		s.anthropicNonStreamResponse(w, resp, renamer)
 	}
 }
 
@@ -212,8 +249,18 @@ func extractAnthropicText(raw json.RawMessage) string {
 
 // ── 非流式 Anthropic message 响应 ──
 
-func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Response) {
+func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Response, renamer *toolconv.Renamer) {
 	var content strings.Builder
+	var reasoning strings.Builder
+	// 工具调用聚合:按 index 分组,首个 chunk 提供 id/name,后续 arguments 片段按序拼接
+	type tcAgg struct {
+		id        string
+		name      string
+		arguments strings.Builder
+	}
+	toolCalls := map[int]*tcAgg{}
+	var toolCallOrder []int
+
 	_ = upstream.ReadSSE(resp, func(chunk upstream.SSEChunk) error {
 		if chunk.IsDone {
 			return nil
@@ -221,7 +268,16 @@ func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Re
 		var obj struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
@@ -230,14 +286,59 @@ func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Re
 		}
 		for _, c := range obj.Choices {
 			content.WriteString(c.Delta.Content)
+			reasoning.WriteString(c.Delta.Reasoning)
+			for _, tc := range c.Delta.ToolCalls {
+				agg, ok := toolCalls[tc.Index]
+				if !ok {
+					agg = &tcAgg{}
+					toolCalls[tc.Index] = agg
+					toolCallOrder = append(toolCallOrder, tc.Index)
+				}
+				if tc.ID != "" {
+					agg.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					agg.name = tc.Function.Name
+				}
+				agg.arguments.WriteString(tc.Function.Arguments)
+			}
 		}
 		return nil
 	})
 
 	text := content.String()
 	var contentBlocks []map[string]any
+	// 思考链:上游 reasoning_content → Anthropic thinking block(置于 text 之前)
+	if reasoning.Len() > 0 {
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type":      "thinking",
+			"thinking":  reasoning.String(),
+			"signature": "",
+		})
+	}
 	if text != "" {
 		contentBlocks = append(contentBlocks, map[string]any{"type": "text", "text": text})
+	}
+	// 有工具调用时输出 tool_use block(arguments 是 JSON 字符串,unmarshal 成 map)
+	stopReason := "end_turn"
+	if len(toolCallOrder) > 0 {
+		stopReason = "tool_use"
+		for _, idx := range toolCallOrder {
+			agg := toolCalls[idx]
+			var input map[string]any
+			if agg.arguments.Len() > 0 {
+				_ = json.Unmarshal([]byte(agg.arguments.String()), &input)
+			}
+			if input == nil {
+				input = map[string]any{}
+			}
+			contentBlocks = append(contentBlocks, map[string]any{
+				"type":  "tool_use",
+				"id":    agg.id,
+				"name":  renamer.Restore(agg.name),
+				"input": input,
+			})
+		}
 	}
 	if len(contentBlocks) == 0 {
 		contentBlocks = append(contentBlocks, map[string]any{"type": "text", "text": ""})
@@ -249,7 +350,7 @@ func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Re
 		"role":          "assistant",
 		"model":         s.model,
 		"content":       contentBlocks,
-		"stop_reason":   "end_turn",
+		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":  0, // 上游 usage 未透传，置 0
@@ -261,7 +362,7 @@ func (s *Server) anthropicNonStreamResponse(w http.ResponseWriter, resp *http.Re
 
 // ── 流式 Anthropic SSE ──
 
-func (s *Server) anthropicStreamResponse(w http.ResponseWriter, resp *http.Response) {
+func (s *Server) anthropicStreamResponse(w http.ResponseWriter, resp *http.Response, renamer *toolconv.Renamer) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -287,8 +388,18 @@ func (s *Server) anthropicStreamResponse(w http.ResponseWriter, resp *http.Respo
 	}
 	s.anthropicEvent(w, flusher, start)
 
-	// 边收边转发 text blocks
-	blockOpen := false
+	// 边收边转发 thinking / text / tool_use blocks
+	blockOpen := false    // text block 是否已打开
+	thinkingOpen := false // thinking block 是否已打开
+	blockIndex := 0
+	// 工具调用聚合:按 index 分组,首个 chunk 提供 id/name,后续 arguments 片段按序拼接
+	type tcAgg struct {
+		id        string
+		name      string
+		arguments strings.Builder
+	}
+	toolCalls := map[int]*tcAgg{}
+	var toolCallOrder []int
 	_ = upstream.ReadSSE(resp, func(chunk upstream.SSEChunk) error {
 		if chunk.IsDone {
 			return nil
@@ -296,7 +407,16 @@ func (s *Server) anthropicStreamResponse(w http.ResponseWriter, resp *http.Respo
 		var obj struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
@@ -304,23 +424,77 @@ func (s *Server) anthropicStreamResponse(w http.ResponseWriter, resp *http.Respo
 			return nil
 		}
 		for _, c := range obj.Choices {
+			// 思考链:reasoning_content → thinking block(先于 text)
+			if c.Delta.Reasoning != "" {
+				if !thinkingOpen {
+					s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+					thinkingOpen = true
+				}
+				s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": c.Delta.Reasoning}})
+			}
 			text := c.Delta.Content
-			if text == "" {
-				continue
+			if text != "" {
+				if !blockOpen {
+					s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "text", "text": ""}})
+					blockOpen = true
+				}
+				s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "text_delta", "text": text}})
 			}
-			if !blockOpen {
-				s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
-				blockOpen = true
+			for _, tc := range c.Delta.ToolCalls {
+				agg, ok := toolCalls[tc.Index]
+				if !ok {
+					agg = &tcAgg{}
+					toolCalls[tc.Index] = agg
+					toolCallOrder = append(toolCallOrder, tc.Index)
+				}
+				if tc.ID != "" {
+					agg.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					agg.name = tc.Function.Name
+				}
+				agg.arguments.WriteString(tc.Function.Arguments)
 			}
-			s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
 		}
 		flusher.Flush()
 		return nil
 	})
-	if blockOpen {
-		s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_stop", "index": 0})
+	if thinkingOpen {
+		s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
 	}
-	s.anthropicEvent(w, flusher, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+	if blockOpen {
+		s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
+	}
+	// 有工具调用时输出 tool_use 事件序列
+	stopReason := "end_turn"
+	if len(toolCallOrder) > 0 {
+		stopReason = "tool_use"
+		for _, idx := range toolCallOrder {
+			agg := toolCalls[idx]
+			s.anthropicEvent(w, flusher, map[string]any{
+				"type":  "content_block_start",
+				"index": blockIndex,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    agg.id,
+					"name":  renamer.Restore(agg.name),
+					"input": map[string]any{},
+				},
+			})
+			if agg.arguments.Len() > 0 {
+				s.anthropicEvent(w, flusher, map[string]any{
+					"type":  "content_block_delta",
+					"index": blockIndex,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": agg.arguments.String()},
+				})
+			}
+			s.anthropicEvent(w, flusher, map[string]any{"type": "content_block_stop", "index": blockIndex})
+			blockIndex++
+		}
+	}
+	s.anthropicEvent(w, flusher, map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
 	s.anthropicEvent(w, flusher, map[string]any{"type": "message_stop"})
 	flusher.Flush()
 }

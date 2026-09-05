@@ -16,10 +16,13 @@
 - 🔑 **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
 - 🏗 **Go 单二进制** — 无外部依赖，`go build` 即得
 
-> ⚠️ **原生工具调用受限** — CNB 上游禁止原生 `tools` 参数（403 `Agent calls are not allowed`）。
-> 客户端声明的工具会被透传，但模型返回的 `tool_calls` 不经过解析/执行/桥接。
+> ✅ **原生工具调用已支持** — `tools` 参数与 `tool_calls` 闭环（流式/非流式）均已透传。
+> 网关自动处理上游限制，客户端无感：
+> - 工具名自动加 `cnb_` 前缀转发（上游白名单要求），响应时还原原名；
+> - `tool_choice` 字段被网关丢弃（上游对 `tool_choice:"auto"` 直接 403，不带该字段时上游会自动调用工具，行为等价）；
+> - 工具历史需 `tool_call_id` 配对（assistant 的 `tool_calls` ↔ tool 消息）。
 >
-> ✅ **推荐方案：搭配 ToolForge 中间件**（见下方 [Docker 编排](#docker-编排toolforge--cnb2api)）— 通过 XYML 提示词注入实现完整工具调用支持。
+> 🔁 **备选方案：ToolForge 中间件**（见下方 [Docker 编排](#docker-编排toolforge--cnb2api)）— 通过 XYML 提示词注入实现工具调用，仍可用作备选。
 
 ## 快速开始
 
@@ -42,7 +45,7 @@ cp config.example.json config.json
 或直接用环境变量（无需配置文件）：
 
 ```bash
-CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4-flash ./cnb2api
+CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4-flash CNB2API_UPSTREAM=https://cnb.cool ./cnb2api
 ```
 
 ### 3. 验证
@@ -80,7 +83,8 @@ curl -s http://localhost:7863/pool
   "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
   "pool_min": 2,
   "pool_max": 8,
-  "ttl_minutes": 30
+  "ttl_minutes": 30,
+  "upstream": "https://cnb.cool"
 }
 ```
 
@@ -93,6 +97,7 @@ curl -s http://localhost:7863/pool
 | `pool_min` | `CNB2API_POOL_MIN` | `2` | 凭证池最小凭证数 |
 | `pool_max` | `CNB2API_POOL_MAX` | `8` | 凭证池最大凭证数（并发上限） |
 | `ttl_minutes` | `CNB2API_TTL_MINUTES` | `30` | 凭证有效期（分钟） |
+| `upstream` | `CNB2API_UPSTREAM` | `https://cnb.cool` | 上游基础地址（可指向 workers 代理等） |
 
 ### 模型说明
 
