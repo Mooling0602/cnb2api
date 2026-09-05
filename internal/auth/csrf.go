@@ -43,6 +43,21 @@ var (
 	chatPath    = "/ai/chat/completions"
 )
 
+// SetBaseURL 设置上游基础地址（如 https://cnb.cool 或 https://cnbcool.almochi.workers.dev）。
+// 必须在创建凭证池之前调用；空值保持默认。
+func SetBaseURL(u string) {
+	if u == "" {
+		return
+	}
+	u = strings.TrimRight(u, "/")
+	if u != "" {
+		baseURL = u
+	}
+}
+
+// BaseURL 返回当前上游基础地址。
+func BaseURL() string { return baseURL }
+
 // ErrInvalidToken 表示 token 获取或校验失败。
 var ErrInvalidToken = errors.New("cnb: invalid csrf token")
 

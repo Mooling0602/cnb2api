@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"cnb2api/internal/auth"
+	"cnb2api/internal/toolconv"
 	"cnb2api/internal/upstream"
 )
 
@@ -104,14 +105,17 @@ type chatRequest struct {
 	Messages        []chatMsg         `json:"messages"`
 	MaxTokens       int               `json:"max_tokens"`
 	Tools           []json.RawMessage `json:"tools"`
+	ToolChoice      json.RawMessage   `json:"tool_choice"`
 	Temperature     *float64          `json:"temperature"`
 	TopP            *float64          `json:"top_p"`
 	ReasoningEffort *string           `json:"reasoning_effort"`
 }
 
 type chatMsg struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  json.RawMessage `json:"tool_calls"`
+	ToolCallID string          `json:"tool_call_id"`
 }
 
 // extractChatContent 兼容 content 为 string 或数组(多模态)两种格式,提取纯文本。
@@ -194,8 +198,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		for _, m := range req.Messages {
 			totalChars += len(extractChatContent(m.Content))
 		}
-		log.Printf("[REQ] model=%s stream=%v msgs=%d chars=%d tools=%d",
-			req.Model, req.Stream, len(req.Messages), totalChars, len(req.Tools))
+		tc := ""
+		if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
+			tc = string(req.ToolChoice)
+			if len(tc) > 120 {
+				tc = tc[:120] + "..."
+			}
+		}
+		log.Printf("[REQ] model=%s stream=%v msgs=%d chars=%d tools=%d max_tokens=%d temp=%v tc=%s",
+			req.Model, req.Stream, len(req.Messages), totalChars, len(req.Tools), req.MaxTokens, req.Temperature, tc)
 		// 诊断: 保存大请求体到 /tmp/cnb2api_last_req.json(仅当 msgs>100 或 chars>100000)
 		if totalChars > 100000 || len(req.Messages) > 100 {
 			if err := os.WriteFile("/tmp/cnb2api_last_req.json", body, 0o644); err == nil {
@@ -222,15 +233,32 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ReasoningEffort != nil {
 		upReq.ReasoningEffort = req.ReasoningEffort
+	} else {
+		// 默认思考:客户端未指定 reasoning_effort 时,默认 low(最轻量)。
+		// 实测上游 enable_thinking=true 单独不触发思考链,必须用 reasoning_effort。
+		effort := "low"
+		upReq.ReasoningEffort = &effort
 	}
 
-	// 消息转换:openclaw 自定义格式 → 上游可接受的 user/assistant 序列
+	// 工具定义:统一提取 + 加 cnb_ 前缀(上游白名单要求),响应时还原,客户端无感。
+	renamer := toolconv.NewRenamer()
+	upReq.Tools = toolconv.ToUpstream(toolconv.FromOpenAIChat(req.Tools), renamer)
+	// tool_choice:不转发。
+	// 实测上游对 tool_choice:"auto" 直接 403 [FORBIDDEN]Agent calls are not allowed in this scenario
+	// (即使工具名已带 cnb_ 前缀);而不带 tool_choice 时上游会自动调用工具(行为等价于 auto)。
+	// 因此网关统一丢弃该字段,由上游自动选择工具。
+	if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
+		log.Printf("[REQ] tool_choice dropped (upstream rejects it): %s", string(req.ToolChoice))
+	}
+
+	// 消息转换:OpenAI 原生工具闭环 + openclaw 自定义格式降级
 	// 策略:
-	//  1. toolResult/tool → user 消息,加 [工具执行结果] 前缀
-	//  2. 连续多条 user(多个工具结果连发)→ 合并为一条,避免上游模型困惑
-	//  3. 失败占位/空消息 → 过滤或替换为有意义内容
-	//  4. assistant 空 content(工具调用后)→ (assistant called tools)
+	//  1. 请求带 tools → 原生透传:assistant 的 tool_calls、tool 角色的 tool_call_id 原样保留
+	//  2. 无 tools → 旧降级:toolResult/tool → user 消息,加 [工具执行结果] 前缀
+	//  3. 连续多条 user(多个工具结果连发)→ 合并为一条,避免上游模型困惑
+	//  4. 失败占位/空消息 → 过滤或替换为有意义内容
 	//  5. 不做历史截断(用户要求保留完整上下文)
+	nativeTools := len(req.Tools) > 0
 	msgsToProcess := req.Messages
 	var converted []upstream.ChatMessage
 	appendUser := func(content string) {
@@ -259,20 +287,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			appendUser("[工具执行结果] " + content)
 			continue
 		}
-		// openclaw 自定义角色 toolResult(工具执行结果),上游不认,转 user 并合并
-		if role == "toolResult" {
-			if content == "" {
-				content = "(tool result)"
-			}
-			appendUser("[工具执行结果] " + content)
-			continue
-		}
-		// 上游不认 tool 角色,转 user 并合并
+		// tool 角色:原生闭环时透传 tool_call_id,否则降级为 user
 		if role == "tool" {
 			if content == "" {
 				content = "(tool result)"
 			}
-			appendUser("[工具执行结果] " + content)
+			if nativeTools {
+				converted = append(converted, upstream.ChatMessage{Role: "tool", Content: content, ToolCallID: m.ToolCallID})
+			} else {
+				appendUser("[工具执行结果] " + content)
+			}
 			continue
 		}
 		// user 消息:如果上一条是 user 也合并(连续 user)
@@ -280,11 +304,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			appendUser(content)
 			continue
 		}
-		// assistant 带 tool_calls 的消息:content 通常为 null,转成说明文本
+		// assistant 带 tool_calls 的消息:原生透传(content 为 null 保持空字符串)
+		// 历史中 tool_calls 的工具名是客户端原名,转发上游前同样加前缀(与 renamer 一致)
+		if role == "assistant" && len(m.ToolCalls) > 0 && string(m.ToolCalls) != "null" {
+			var calls []upstream.ToolCall
+			if err := json.Unmarshal(m.ToolCalls, &calls); err == nil && len(calls) > 0 {
+				for i := range calls {
+					calls[i].Function.Name = renamer.Forward(calls[i].Function.Name)
+				}
+				converted = append(converted, upstream.ChatMessage{Role: "assistant", Content: content, ToolCalls: calls})
+				continue
+			}
+		}
+		// assistant 空 content(工具调用后)→ 说明文本(仅旧降级路径)
 		if role == "assistant" && content == "" {
 			content = "(assistant called tools)"
 		}
-		// 合并后的 user 消息不允许紧跟另一条 user 时直接 append assistant
 		converted = append(converted, upstream.ChatMessage{Role: role, Content: content})
 	}
 	// 清理空消息和尾部空 user
@@ -298,9 +333,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	upReq.Messages = cleaned
 
-	// 强制设置 maxTokens 以避免长上下文请求被上游截断输出
-	// deepseek-v4 系列默认支持 65k 输出,设 60k 留余量
-	upReq.MaxTokens = 60000
+	// maxTokens 策略:尊重客户端传入的值(避免小值被放大导致超上下文限制);
+	// 客户端未传时才设默认值,避免长上下文请求被上游截断输出
+	// (deepseek-v4 系列默认支持 65k 输出,60k 留余量)
+	if upReq.MaxTokens <= 0 {
+		upReq.MaxTokens = 60000
+	}
 
 	// 转发前日志:消息转换结果摘要
 	{
@@ -319,20 +357,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp, err := s.upstream.Chat(ctx, upReq)
 	if err != nil {
+		// 诊断: 上游报错时保存请求体,便于定位参数问题
+		if werr := os.WriteFile("/tmp/cnb2api_last_req.json", body, 0o644); werr == nil {
+			log.Printf("[ERR] upstream rejected request, body saved (%d bytes): %v", len(body), err)
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
 		return
 	}
 	defer resp.Body.Close()
 
 	if req.Stream {
-		s.streamResponse(w, resp)
+		s.streamResponse(w, resp, renamer)
 	} else {
-		s.nonStreamResponse(w, resp)
+		s.nonStreamResponse(w, resp, renamer)
 	}
 }
 
 // streamResponse 透传 SSE 流,并转换成 OpenAI 流式格式。
-func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
+// renamer 用于把上游工具名还原为客户端原名。
+func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, renamer *toolconv.Renamer) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -350,13 +393,17 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 	var stdID, stdModel string
 	var stdCreated int64
 	var stdUsage map[string]any
+	var lastFinish string // 上游最后一个 finish_reason(工具调用时为 tool_calls)
 	_ = upstream.ReadSSE(resp, func(chunk upstream.SSEChunk) error {
 		if chunk.IsDone {
 			// 收尾 chunk:finish_reason + usage + [DONE]
 			if stdID != "" {
+				if lastFinish == "" {
+					lastFinish = "stop"
+				}
 				final := map[string]any{
 					"id": stdID, "model": stdModel, "created": stdCreated, "object": "chat.completion.chunk",
-					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": lastFinish}},
 				}
 				if stdUsage != nil {
 					final["usage"] = stdUsage
@@ -377,7 +424,17 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 				Delta struct {
 					Content   string `json:"content"`
 					Reasoning string `json:"reasoning_content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
 		}
 		if err := json.Unmarshal(chunk.Raw, &obj); err != nil {
@@ -396,6 +453,9 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 			stdUsage = obj.Usage
 		}
 		for _, c := range obj.Choices {
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				lastFinish = *c.FinishReason
+			}
 			if c.Delta.Content != "" {
 				chunkOut := map[string]any{
 					"id": stdID, "model": stdModel, "created": stdCreated, "object": "chat.completion.chunk",
@@ -412,6 +472,24 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 				data, _ := json.Marshal(chunkOut)
 				w.Write([]byte("data: " + string(data) + "\n\n"))
 			}
+			// tool_calls:透传为标准 OpenAI 流式 chunk
+			if len(c.Delta.ToolCalls) > 0 {
+				tcOut := make([]any, 0, len(c.Delta.ToolCalls))
+				for _, tc := range c.Delta.ToolCalls {
+					tcOut = append(tcOut, map[string]any{
+						"index":    tc.Index,
+						"id":       tc.ID,
+						"type":     tc.Type,
+						"function": map[string]any{"name": renamer.Restore(tc.Function.Name), "arguments": tc.Function.Arguments},
+					})
+				}
+				chunkOut := map[string]any{
+					"id": stdID, "model": stdModel, "created": stdCreated, "object": "chat.completion.chunk",
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": tcOut}}},
+				}
+				data, _ := json.Marshal(chunkOut)
+				w.Write([]byte("data: " + string(data) + "\n\n"))
+			}
 		}
 		flusher.Flush()
 		return nil
@@ -419,7 +497,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 }
 
 // nonStreamResponse 聚合 SSE 为单次 JSON 响应。
-func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response) {
+func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, renamer *toolconv.Renamer) {
 	var (
 		content     strings.Builder
 		reasoning   strings.Builder
@@ -429,6 +507,16 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response) {
 		lastFinish  string
 		finalUsage  json.RawMessage
 	)
+
+	// 工具调用聚合:按 index 分组,首个 chunk 提供 id/type/name,后续 arguments 片段按序拼接
+	type tcAgg struct {
+		id        string
+		typ       string
+		name      string
+		arguments strings.Builder
+	}
+	toolCalls := map[int]*tcAgg{}
+	var toolCallOrder []int
 
 	_ = upstream.ReadSSE(resp, func(chunk upstream.SSEChunk) error {
 		if chunk.IsDone {
@@ -442,6 +530,15 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response) {
 				Delta struct {
 					Content   string `json:"content"`
 					Reasoning string `json:"reasoning_content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -465,6 +562,24 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response) {
 			if c.FinishReason != nil {
 				lastFinish = *c.FinishReason
 			}
+			for _, tc := range c.Delta.ToolCalls {
+				agg, ok := toolCalls[tc.Index]
+				if !ok {
+					agg = &tcAgg{}
+					toolCalls[tc.Index] = agg
+					toolCallOrder = append(toolCallOrder, tc.Index)
+				}
+				if tc.ID != "" {
+					agg.id = tc.ID
+				}
+				if tc.Type != "" {
+					agg.typ = tc.Type
+				}
+				if tc.Function.Name != "" {
+					agg.name = tc.Function.Name
+				}
+				agg.arguments.WriteString(tc.Function.Arguments)
+			}
 		}
 		if len(obj.Usage) > 0 {
 			finalUsage = obj.Usage
@@ -476,6 +591,26 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response) {
 		"role":              "assistant",
 		"content":           content.String(),
 		"reasoning_content": reasoning.String(),
+	}
+	// 有工具调用时输出标准 tool_calls 数组
+	if len(toolCallOrder) > 0 {
+		tcOut := make([]any, 0, len(toolCallOrder))
+		for _, idx := range toolCallOrder {
+			agg := toolCalls[idx]
+			typ := agg.typ
+			if typ == "" {
+				typ = "function"
+			}
+			tcOut = append(tcOut, map[string]any{
+				"id":   agg.id,
+				"type": typ,
+				"function": map[string]any{
+					"name":      renamer.Restore(agg.name),
+					"arguments": agg.arguments.String(),
+				},
+			})
+		}
+		msg["tool_calls"] = tcOut
 	}
 
 	respObj := map[string]any{

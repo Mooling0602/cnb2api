@@ -28,24 +28,26 @@ import (
 )
 
 type Config struct {
-	Listen  string   `json:"listen"`
-	APIKey  string   `json:"api_key"`
-	Model   string   `json:"model"`
-	Models  []string `json:"models"` // 支持的模型列表（默认 [model]）
-	PoolMin int      `json:"pool_min"`
-	PoolMax int      `json:"pool_max"`
-	TTLMin  int      `json:"ttl_minutes"`
+	Listen   string   `json:"listen"`
+	APIKey   string   `json:"api_key"`
+	Model    string   `json:"model"`
+	Models   []string `json:"models"`   // 支持的模型列表（默认 [model]）
+	Upstream string   `json:"upstream"` // 上游基础地址（默认 https://cnb.cool）
+	PoolMin  int      `json:"pool_min"`
+	PoolMax  int      `json:"pool_max"`
+	TTLMin   int      `json:"ttl_minutes"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		Listen:  ":7863",
-		APIKey:  "",
-		Model:   "deepseek-v4-flash",
-		Models:  []string{"deepseek-v4-flash", "deepseek-v4-pro"},
-		PoolMin: 2,
-		PoolMax: 8,
-		TTLMin:  30,
+		Listen:   ":7863",
+		APIKey:   "",
+		Model:    "deepseek-v4-flash",
+		Models:   []string{"deepseek-v4-flash", "deepseek-v4-pro"},
+		Upstream: "https://cnb.cool",
+		PoolMin:  2,
+		PoolMax:  8,
+		TTLMin:   30,
 	}
 }
 
@@ -85,6 +87,9 @@ func loadConfig(path string) (Config, error) {
 			cfg.TTLMin = n
 		}
 	}
+	if v := os.Getenv("CNB2API_UPSTREAM"); v != "" {
+		cfg.Upstream = v
+	}
 	return cfg, nil
 }
 
@@ -97,8 +102,11 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	log.Printf("cnb2api starting: listen=%s model=%s pool=[%d,%d] ttl=%dm",
-		cfg.Listen, cfg.Model, cfg.PoolMin, cfg.PoolMax, cfg.TTLMin)
+	// 上游基础地址必须在创建凭证池之前设置（凭证从该地址首页获取）
+	auth.SetBaseURL(cfg.Upstream)
+
+	log.Printf("cnb2api starting: listen=%s model=%s upstream=%s pool=[%d,%d] ttl=%dm",
+		cfg.Listen, cfg.Model, auth.BaseURL(), cfg.PoolMin, cfg.PoolMax, cfg.TTLMin)
 
 	poolCfg := auth.PoolConfig{
 		MinSize: cfg.PoolMin,

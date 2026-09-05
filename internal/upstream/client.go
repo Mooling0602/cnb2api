@@ -35,9 +35,12 @@ import (
 )
 
 const (
-	chatURL   = "https://cnb.cool/ai/chat/completions"
+	chatPath  = "/ai/chat/completions"
 	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+
+// chatURL 返回当前上游聊天接口地址（跟随 auth.BaseURL 配置）。
+func chatURL() string { return auth.BaseURL() + chatPath }
 
 // ChatRequest 是 CNB chat/completions 的请求体（OpenAI 兼容超集）。
 type ChatRequest struct {
@@ -56,8 +59,24 @@ type ChatRequest struct {
 
 // ChatMessage 是聊天消息。
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 消息的工具调用
+	ToolCallID string     `json:"tool_call_id,omitempty"` // tool 消息对应的调用 ID
+}
+
+// ToolCall 是 assistant 消息里的工具调用（OpenAI 标准格式）。
+// 注意:function.arguments 是 JSON 字符串,与工具定义里的 parameters(map)不同。
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction 是工具调用的函数信息。
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // Tool 是函数工具定义。
@@ -169,8 +188,12 @@ func (c *Client) doChat(ctx context.Context, cs *auth.CSRF, req *ChatRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	// 内容清洗:上游 CNB 对特定 emoji(如台湾国旗 🇹🇼)触发 500 Internal Server Error
+	// (实测任何消息角色 user/system/tool 均触发,属上游内容审核 bug)。
+	// 网关在最后一公里做等价替换,规避上游 bug,非内容审查。
+	body = sanitizeUpstreamBody(body)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +206,13 @@ func (c *Client) doChat(ctx context.Context, cs *auth.CSRF, req *ChatRequest) (*
 	httpReq.AddCookie(&http.Cookie{Name: "csrfkey", Value: cs.Key, Path: "/"})
 
 	return c.hc.Do(httpReq)
+}
+
+// sanitizeUpstreamBody 清洗转发上游的请求体,规避上游已知 bug。
+// 目前仅处理:台湾国旗 emoji 🇹🇼 → "tw"(上游对该 emoji 返回 500)。
+func sanitizeUpstreamBody(body []byte) []byte {
+	// 🇹🇼 是 U+1F1F9 U+1F1FC(regional indicator T + W)
+	return bytes.ReplaceAll(body, []byte("\U0001F1F9\U0001F1FC"), []byte("tw"))
 }
 
 // ReadSSE 从响应体读取 SSE 事件，逐行回调。返回是否正常结束。
