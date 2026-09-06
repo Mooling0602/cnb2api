@@ -1,3 +1,0 @@
-[submodule "docker/toolforge"]
-	path = docker/toolforge
-	url = git@github.com:Mooling0602/toolforge.git
