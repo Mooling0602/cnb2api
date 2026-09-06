@@ -1,9 +1,12 @@
 // Package server 实现 OpenAI 兼容的 HTTP API:
+// 所有业务端点同时支持带 /v1 前缀与不带前缀两种形式(下以 /v1 形式列出)。
 //
-//	GET  /v1/models            - 列出可用模型
-//	POST /v1/chat/completions  - 聊天(流式/非流式)
-//	GET  /healthz              - 健康检查
-//	GET  /pool                 - CSRF 凭证池状态
+//	GET  /v1/models              - 列出可用模型
+//	POST /v1/chat/completions    - 聊天(流式/非流式)
+//	POST /v1/messages            - Anthropic Messages API
+//	POST /v1/responses           - OpenAI Responses API
+//	GET  /healthz                - 健康检查
+//	GET  /pool                   - CSRF 凭证池状态
 package server
 
 import (
@@ -45,19 +48,29 @@ func New(pool *auth.Pool, apiKey, model string, models []string, timeout time.Du
 }
 
 // Handler 返回 HTTP handler(可挂到任何路由)。
+// 所有 OpenAI/Anthropic 兼容端点同时支持带 /v1 前缀与不带前缀(根路径)两种形式,
+// 便于接入 OpenAI SDK base_url 配成根路径或 /v1 的各类客户端。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	// 每个业务端点同时注册 /v1/xxx 与 /xxx 两种形式
+	s.register(mux, "/models", s.handleModels)
+	s.register(mux, "/chat/completions", s.handleChat)
 	// Anthropic Messages API
-	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
+	s.register(mux, "/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", s.handleAnthropicCountTokens)
+	s.register(mux, "/messages/count_tokens", s.handleAnthropicCountTokens)
 	// OpenAI Responses API
-	mux.HandleFunc("/v1/responses", s.handleResponses)
+	s.register(mux, "/responses", s.handleResponses)
+	// 管理端点保持原路径不变
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/pool", s.handlePool)
 	return mux
+}
+
+// register 将处理函数同时注册到 /xxx 与 /v1/xxx 两个路径。
+func (s *Server) register(mux *http.ServeMux, path string, h http.HandlerFunc) {
+	mux.HandleFunc(path, h)
+	mux.HandleFunc("/v1"+path, h)
 }
 
 // auth 校验 API key(配置为空则跳过鉴权)。
