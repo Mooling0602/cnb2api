@@ -1,161 +1,95 @@
 # cnb2api
 
-> CNB (`cnb.cool`) NPC 聊天接口的 OpenAI 兼容反向代理，Go 实现。
+> 用 Go 实现的、把 CNB（cnb.cool）NPC 聊天接口封装成 OpenAI / Anthropic 兼容 API 的免登录反向代理网关。
 
-逆向自 `cnb.cool` 前端 `_app.js` 的 NPC 聊天接口，将其封装为标准 OpenAI 兼容 API，
-免登录即可调用 `npc/CodeBuddy(deepseek-v4-flash)` 等 CNB NPC。
+## 使用方法
 
-## 功能特性
-
-- 🔓 **免登录** — 自动从 CNB 首页获取 CSRF 凭证（`csrfkey` cookie + `csrftoken` header 配对），无需账号即可调用
-- 🤖 **双模型支持** — `deepseek-v4-flash` + `deepseek-v4-pro`（均透传至 CNB 上游）
-- 🔄 **弹性凭证池** — 并发获取多个独立会话凭证，round-robin 轮转，天然支持并发请求
-- 🔧 **自动维护** — 凭证过期自动淘汰、补充、健康检查、连续失败自动失效
-- 📡 **SSE 流式** — 流式透传上游 SSE；非流式自动聚合 `content` + `reasoning_content`
-- 🎭 **多协议支持** — OpenAI Chat Completions + **Anthropic Messages**（`/v1/messages`、`/anthropic/v1/messages`）+ **OpenAI Responses**（`/v1/responses`，typed SSE events）
-- 🔑 **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
-- 🏗 **Go 单二进制** — 无外部依赖，`go build` 即得
-
-> ✅ **原生工具调用已支持** — `tools` 参数与 `tool_calls` 闭环（流式/非流式）均已透传。
-> 网关自动处理上游限制，客户端无感：
-> - 工具名自动加 `cnb_` 前缀转发（上游白名单要求），响应时还原原名；
-> - `tool_choice` 字段被网关丢弃（上游对 `tool_choice:"auto"` 直接 403，不带该字段时上游会自动调用工具，行为等价）；
-> - 工具历史需 `tool_call_id` 配对（assistant 的 `tool_calls` ↔ tool 消息）。
-
-## 快速开始
-
-### 1. 构建 & 配置
+构建：
 
 ```bash
-git clone https://github.com/lwjlwjlwjlwj/cnb2api.git
+git clone https://github.com/Dreamwxz/cnb2api.git
 cd cnb2api
 go build -o cnb2api ./cmd/server
-cp config.example.json config.json
-# 编辑 config.json，设置 api_key（可留空 = 不鉴权）
 ```
 
-### 2. 启动服务
+准备配置：
+
+```bash
+cp config.example.json config.json
+# 编辑 config.json（字段说明见下方「配置说明」；api_key 留空 = 不鉴权）
+```
+
+启动：
 
 ```bash
 ./cnb2api -config config.json
 ```
 
-或直接用环境变量（无需配置文件）：
+不写配置文件、仅用环境变量也能启动：
 
 ```bash
-CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4-flash CNB2API_UPSTREAM=https://cnb.cool ./cnb2api
+CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4-flash \
+CNB2API_UPSTREAM=https://cnb.cool ./cnb2api
 ```
 
-### 3. 验证
+Docker 部署（docker-compose.yml 已含健康检查）：
 
 ```bash
-# 健康检查
-curl -s http://localhost:7863/healthz
+docker compose up -d --build   # 宿主机 7863 -> 容器 7863
+```
+
+验证是否可用：
+
+```bash
+# 存活探测（免鉴权，返回 200 OK）
+curl -s http://localhost:7863/
 
 # 模型列表
 curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
-# 聊天（非流式）
+# 对话（非流式）
 curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'
 
-# 聊天（流式）
+# 对话（流式）
 curl -N http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
 
 # 凭证池状态
-curl -s http://localhost:7863/pool
+curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
 ```
+
+鉴权说明：除根路径 `/`（免鉴权存活探测，返回 200 OK）外，其余所有端点统一鉴权（同时支持 OpenAI `Authorization: Bearer` 与 Anthropic `x-api-key`）；业务接口同时支持 /v1/... 与 /... 两种路径。Docker healthcheck 探测 `/` 即可，无需携带 key。
 
 ## 配置说明
 
-```json
+唯一命令行参数是 -config <json 路径>。配置优先级：默认值 → JSON 文件 → 环境变量覆盖。
+
+```jsonc
+// config.json（示例）
 {
-  "listen": ":7863",
-  "api_key": "your-api-key",
-  "model": "deepseek-v4-flash",
-  "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-  "pool_min": 2,
-  "pool_max": 8,
-  "ttl_minutes": 30,
-  "upstream": "https://cnb.cool"
+  "listen": ":7863",                                  // 监听地址
+  "api_key": "cnb-sk-...",                            // API 鉴权 key；留空 "" = 不鉴权
+  "model": "deepseek-v4-flash",                       // 默认模型
+  "models": ["deepseek-v4-flash", "deepseek-v4-pro"], // 支持的模型白名单（仅 JSON 可配）
+  "pool_min": 2,                                      // 凭证池最少常驻凭证数
+  "pool_max": 8,                                      // 凭证池最大凭证数（≈并发上限）
+  "ttl_minutes": 30,                                  // 凭证有效期（分钟）
+  "upstream": "https://cnb.cool"                      // 上游地址（凭证也从该页获取，可指向代理）
 }
 ```
 
-| 字段 | 环境变量 | 默认值 | 说明 |
-|---|---|---|---|
-| `listen` | `CNB2API_LISTEN` | `:7863` | 监听地址 |
-| `api_key` | `CNB2API_API_KEY` | 空 | API 鉴权 key（空=不鉴权） |
-| `model` | `CNB2API_MODEL` | `deepseek-v4-flash` | 默认模型 |
-| `models` | — | `[flash, pro]` | 支持的模型列表 |
-| `pool_min` | `CNB2API_POOL_MIN` | `2` | 凭证池最小凭证数 |
-| `pool_max` | `CNB2API_POOL_MAX` | `8` | 凭证池最大凭证数（并发上限） |
-| `ttl_minutes` | `CNB2API_TTL_MINUTES` | `30` | 凭证有效期（分钟） |
-| `upstream` | `CNB2API_UPSTREAM` | `https://cnb.cool` | 上游基础地址（可指向 workers 代理等） |
+除 models 外，每个字段都有对应的环境变量，环境变量会覆盖 JSON 中的值（数值型解析失败会被忽略）：
 
-### 模型说明
+- listen → CNB2API_LISTEN，默认 :7863
+- api_key → CNB2API_API_KEY，默认空（= 不鉴权）
+- model → CNB2API_MODEL，默认 deepseek-v4-flash
+- pool_min → CNB2API_POOL_MIN，默认 2
+- pool_max → CNB2API_POOL_MAX，默认 8
+- ttl_minutes → CNB2API_TTL_MINUTES，默认 30
+- upstream → CNB2API_UPSTREAM，默认 https://cnb.cool
+- models 无环境变量，只能写在 JSON 里
 
-| 模型 | 说明 |
-|---|---|
-| `deepseek-v4-flash` | 默认模型 |
-| `deepseek-v4-pro` | 已支持，但**上游实际仍调用 flash**（CNB 上游仅暴露 flash 接口，pro 为前端映射），输出行为与 flash 有差异（如写诗风格） |
-
-## API
-
-### `POST /v1/chat/completions`
-
-OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p`。
-
-### `GET /v1/models`
-
-返回配置的模型。
-
-### `GET /pool`
-
-查看凭证池状态（每个凭证的 csrfkey、token 前缀、有效期、错误计数）。
-
-### `GET /healthz`
-
-健康检查。
-
-## 鉴权机制（逆向说明）
-
-CNB 的 NPC 聊天接口 `POST /ai/chat/completions` 采用 CSRF 双因子校验：
-
-1. `GET https://cnb.cool/` 首页：
-   - 响应 `Set-Cookie: csrfkey=<32位hex>`（HTTPOnly）
-   - HTML 内嵌 `<script id="cnb-csrftoken-script">window.csrftoken="<40位hex>"</script>`
-2. 调用 chat 接口需同时携带：
-   - `Cookie: csrfkey=<csrfkey>`
-   - `Header: Csrftoken: <csrftoken>`
-
-两者必须配对（同一会话签发的）。缺失其一或值不匹配 → `401 {"errcode":16,"errmsg":"CSRF 校验失败"}`。
-
-本项目的 `internal/auth` 包每次用独立 cookie jar 建立新会话获取配对凭证，
-多个凭证组成池供并发请求轮转使用。
-
-## 目录结构
-
-```
-cnb2api/
-├── cmd/server/main.go            # 入口：配置、凭证池初始化、HTTP 服务
-├── internal/auth/csrf.go         # CSRF 凭证获取 + 凭证池（核心）
-├── internal/upstream/client.go   # 上游请求构造 + SSE 读取
-├── internal/server/handler.go    # OpenAI 兼容 HTTP handler
-├── internal/server/anthropic.go  # Anthropic Messages 适配
-├── internal/server/responses.go  # OpenAI Responses 适配
-├── config.example.json
-└── go.mod
-```
-
-## 免责声明
-
-本项目仅供学习和研究使用。请遵守 CNB 平台服务条款，自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
-
-## License
-
-MIT
+> 若请求的模型不在 models 白名单内，会静默回退到默认的 model。

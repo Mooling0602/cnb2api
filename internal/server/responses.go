@@ -30,10 +30,6 @@ type responsesRequest struct {
 
 // handleResponses 处理 POST /v1/responses。
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
-		return
-	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
