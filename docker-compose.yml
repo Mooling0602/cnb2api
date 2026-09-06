@@ -13,7 +13,7 @@ services:
     networks:
       - cnb2api-net
     healthcheck:
-      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "-", "http://localhost:7863/healthz"]
+      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "-", "http://localhost:7863/"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -5,8 +5,9 @@
 //	POST /v1/chat/completions    - 聊天(流式/非流式)
 //	POST /v1/messages            - Anthropic Messages API
 //	POST /v1/responses           - OpenAI Responses API
-//	GET  /healthz                - 健康检查
-//	GET  /pool                   - CSRF 凭证池状态
+//
+// 除根路径 "/"(免鉴权存活探测,返回 200 OK)外,所有端点统一鉴权:
+// GET /pool 也需携带 API key。
 package server
 
 import (
@@ -48,35 +49,70 @@ func New(pool *auth.Pool, apiKey, model string, models []string, timeout time.Du
 }
 
 // Handler 返回 HTTP handler(可挂到任何路由)。
+// 除根路径 "/" 为免鉴权存活探测(返回 200 OK)、以及该兜底路径返回的 404 外,
+// 所有已注册端点统一经 withAuth 鉴权。
 // 所有 OpenAI/Anthropic 兼容端点同时支持带 /v1 前缀与不带前缀(根路径)两种形式,
 // 便于接入 OpenAI SDK base_url 配成根路径或 /v1 的各类客户端。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	// 每个业务端点同时注册 /v1/xxx 与 /xxx 两种形式
+	// 根路径:免鉴权存活探测(替代原 /healthz),供 Docker healthcheck 等探活;
+	// 同时作为兜底:未匹配任何已注册端点的未知路径在此返回 404。
+	mux.HandleFunc("/", s.handleRoot)
+	// 每个业务端点同时注册 /v1/xxx 与 /xxx 两种形式,均经 withAuth 鉴权
 	s.register(mux, "/models", s.handleModels)
 	s.register(mux, "/chat/completions", s.handleChat)
 	// Anthropic Messages API
 	s.register(mux, "/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicMessages)
+	mux.HandleFunc("/anthropic/v1/messages", s.withAuth(s.handleAnthropicMessages))
 	s.register(mux, "/messages/count_tokens", s.handleAnthropicCountTokens)
 	// OpenAI Responses API
 	s.register(mux, "/responses", s.handleResponses)
-	// 管理端点保持原路径不变
-	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/pool", s.handlePool)
+	// 管理端点(鉴权)
+	s.register(mux, "/pool", s.handlePool)
 	return mux
 }
 
-// register 将处理函数同时注册到 /xxx 与 /v1/xxx 两个路径。
+// register 将鉴权包装后的处理函数同时注册到 /xxx 与 /v1/xxx 两个路径。
 func (s *Server) register(mux *http.ServeMux, path string, h http.HandlerFunc) {
-	mux.HandleFunc(path, h)
-	mux.HandleFunc("/v1"+path, h)
+	authH := s.withAuth(h)
+	mux.HandleFunc(path, authH)
+	mux.HandleFunc("/v1"+path, authH)
+}
+
+// withAuth 返回单个端点的鉴权包装:校验失败则返回 401,不再向下处理。
+// 只在已注册的具体端点上套用;"/" 兜底(存活探测 / 未知路径 404)不套用,
+// 因此未知路径能先命中 handleRoot 返回 404,而非被鉴权拦截成 401。
+func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.auth(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
+			return
+		}
+		h(w, r)
+	}
+}
+
+// handleRoot 免鉴权存活探测:访问根路径 "/" 一律返回 200 OK(替代原 /healthz)。
+// ServeMux 的 "/" 是兜底模式,会收到所有未匹配更精确路径的请求;
+// 因此仅对确切的 "/" 返回 200,其它未知路径返回 404。
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
 // auth 校验 API key(配置为空则跳过鉴权)。
+// 兼容 OpenAI 风格 Authorization: Bearer 与 Anthropic 风格 x-api-key。
 func (s *Server) auth(r *http.Request) bool {
 	if s.apiKey == "" {
 		return true
+	}
+	if k := r.Header.Get("x-api-key"); k != "" {
+		return k == s.apiKey
 	}
 	got := r.Header.Get("Authorization")
 	got = strings.TrimPrefix(got, "Bearer ")
@@ -85,10 +121,6 @@ func (s *Server) auth(r *http.Request) bool {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
-		return
-	}
 	data := make([]map[string]any, 0, len(s.models))
 	for _, m := range s.models {
 		data = append(data, map[string]any{"id": m, "object": "model", "created": time.Now().Unix(), "owned_by": "cnb"})
@@ -180,10 +212,6 @@ func extractChatContent(raw json.RawMessage) string {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
-		return
-	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
@@ -643,13 +671,6 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, r
 		respObj["usage"] = json.RawMessage(finalUsage)
 	}
 	writeJSON(w, http.StatusOK, respObj)
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
-		"poolSize": s.pool.Count(),
-	})
 }
 
 func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {

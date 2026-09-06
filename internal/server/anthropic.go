@@ -38,10 +38,6 @@ type anthropicTool = toolconv.AnthropicTool
 
 // handleAnthropicMessages 处理 POST /v1/messages。
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	if !s.authAnthropic(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
-		return
-	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
@@ -159,19 +155,6 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	} else {
 		s.anthropicNonStreamResponse(w, resp, renamer)
 	}
-}
-
-// authAnthropic 校验 Anthropic 风格鉴权：x-api-key 头 或 Bearer。
-func (s *Server) authAnthropic(r *http.Request) bool {
-	if s.apiKey == "" {
-		return true
-	}
-	// 优先 x-api-key（Claude Code 标准）
-	if k := r.Header.Get("x-api-key"); k != "" {
-		return k == s.apiKey
-	}
-	// 兼容 Bearer
-	return s.auth(r)
 }
 
 // handleAnthropicCountTokens 处理 POST /v1/messages/count_tokens。
