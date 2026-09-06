@@ -60,6 +60,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// reasoning → 推理等级/思考模式
+	// 客户端未传 reasoning 时不注入任何思考参数:Responses 端点默认无思考,
+	// 避免 reasoning 吃掉 max_output_tokens 预算导致空 content(EMPTY_RESPONSE)。
 	if len(req.Reasoning) > 0 {
 		reasoningEffort := extractResponsesReasoning(req.Reasoning)
 		if reasoningEffort != "" {
@@ -67,10 +69,6 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		enableThinking := true
 		upReq.EnableThinking = &enableThinking
-	} else {
-		// 默认思考:客户端未传 reasoning 时,默认 low(最轻量)。
-		effort := "low"
-		upReq.ReasoningEffort = &effort
 	}
 
 	// 工具定义:统一提取 + 加 cnb_ 前缀(上游白名单要求),响应时还原。
