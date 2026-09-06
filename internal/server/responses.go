@@ -339,9 +339,17 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 	}
 	s.responsesEvent(w, flusher, "response.created", created)
 
-	// 边收边输出 reasoning / text delta
+	// 边收边输出 reasoning / text delta / function_call 参数增量
 	fullText := ""
 	fullReasoning := ""
+	// 工具调用聚合:按 index 分组,首个 chunk 提供 id/name,后续 arguments 片段按序拼接
+	type tcAgg struct {
+		id        string
+		name      string
+		arguments strings.Builder
+	}
+	toolCalls := map[int]*tcAgg{}
+	var toolCallOrder []int
 	_ = upstream.ReadSSE(resp, func(chunk upstream.SSEChunk) error {
 		if chunk.IsDone {
 			return nil
@@ -351,6 +359,14 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 				Delta struct {
 					Content   string `json:"content"`
 					Reasoning string `json:"reasoning_content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
@@ -373,6 +389,41 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 					"delta": c.Delta.Content,
 				}
 				s.responsesEvent(w, flusher, "response.output_text.delta", delta)
+			}
+			for _, tc := range c.Delta.ToolCalls {
+				agg, ok := toolCalls[tc.Index]
+				if !ok {
+					agg = &tcAgg{}
+					toolCalls[tc.Index] = agg
+					toolCallOrder = append(toolCallOrder, tc.Index)
+					// 新工具调用 item 出现:先发 output_item.added(OpenAI Responses 协议)
+					s.responsesEvent(w, flusher, "response.output_item.added", map[string]any{
+						"output_index": tc.Index,
+						"item": map[string]any{
+							"type":      "function_call",
+							"id":        tc.ID,
+							"call_id":   tc.ID,
+							"name":      renamer.Restore(tc.Function.Name),
+							"arguments": "",
+							"status":    "in_progress",
+						},
+					})
+				}
+				if tc.ID != "" {
+					agg.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					agg.name = tc.Function.Name
+				}
+				if tc.Function.Arguments != "" {
+					agg.arguments.WriteString(tc.Function.Arguments)
+					// 流式转发参数增量(OpenAI Responses 协议)
+					s.responsesEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+						"item_id":      agg.id,
+						"output_index": tc.Index,
+						"delta":        tc.Function.Arguments,
+					})
+				}
 			}
 		}
 		return nil
@@ -405,6 +456,18 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 		"status":  "completed",
 		"content": outputContent,
 	})
+	// 工具调用:聚合后输出 function_call items(与流式增量事件一致)
+	for _, idx := range toolCallOrder {
+		agg := toolCalls[idx]
+		output = append(output, map[string]any{
+			"type":      "function_call",
+			"id":        agg.id,
+			"call_id":   agg.id,
+			"name":      renamer.Restore(agg.name),
+			"arguments": agg.arguments.String(),
+			"status":    "completed",
+		})
+	}
 	completed := map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
