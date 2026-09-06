@@ -254,7 +254,9 @@ func (s *Server) responsesNonStreamResponse(w http.ResponseWriter, resp *http.Re
 	})
 
 	text := content.String()
-	var outputContent []map[string]any
+	// 注意:content 必须是非 nil 数组(空数组而非 null),否则 OpenAI SDK 报
+	// "output.content is not iterable" / 客户端框架判定 EMPTY_RESPONSE。
+	outputContent := []map[string]any{}
 	if text != "" {
 		outputContent = append(outputContent, map[string]any{
 			"type":        "output_text",
@@ -397,7 +399,9 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 					toolCalls[tc.Index] = agg
 					toolCallOrder = append(toolCallOrder, tc.Index)
 					// 新工具调用 item 出现:先发 output_item.added(OpenAI Responses 协议)
+					// 注意:SDK 从 data JSON 的 type 字段识别事件类型,必须带上 type。
 					s.responsesEvent(w, flusher, "response.output_item.added", map[string]any{
+						"type":         "response.output_item.added",
 						"output_index": tc.Index,
 						"item": map[string]any{
 							"type":      "function_call",
@@ -418,7 +422,9 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 				if tc.Function.Arguments != "" {
 					agg.arguments.WriteString(tc.Function.Arguments)
 					// 流式转发参数增量(OpenAI Responses 协议)
+					// 注意:SDK 从 data JSON 的 type 字段识别事件类型,必须带上 type。
 					s.responsesEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+						"type":         "response.function_call_arguments.delta",
 						"item_id":      agg.id,
 						"output_index": tc.Index,
 						"delta":        tc.Function.Arguments,
@@ -485,7 +491,8 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 		},
 	}
 	s.responsesEvent(w, flusher, "response.completed", completed)
-	s.responsesEvent(w, flusher, "", map[string]any{"data": "[DONE]"})
+	// 标准 SSE 结束哨兵:SDK 检查 sse.data === "[DONE]",不能 JSON 包装。
+	w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
 }
 
