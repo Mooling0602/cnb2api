@@ -49,7 +49,7 @@ type ChatRequest struct {
 	Messages        []ChatMessage `json:"messages"`
 	Tools           []Tool        `json:"tools,omitempty"`
 	ToolChoice      any           `json:"tool_choice,omitempty"`
-	MaxTokens       int           `json:"maxTokens,omitempty"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
 	ReasoningEffort *string       `json:"reasoning_effort,omitempty"`
 	EnableThinking  *bool         `json:"enable_thinking,omitempty"`
 	PresencePenalty *float64      `json:"presence_penalty,omitempty"`

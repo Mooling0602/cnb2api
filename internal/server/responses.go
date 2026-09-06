@@ -18,13 +18,14 @@ import (
 
 // responsesRequest 是 OpenAI Responses 格式请求。
 type responsesRequest struct {
-	Model        string          `json:"model"`
-	Input        json.RawMessage `json:"input"` // string 或 [items]
-	Instructions string          `json:"instructions"`
-	Tools        json.RawMessage `json:"tools"`
-	ToolChoice   json.RawMessage `json:"tool_choice"`
-	Stream       bool            `json:"stream"`
-	Reasoning    json.RawMessage `json:"reasoning"` // 可选: bool 或 {effort:"low"|"medium"|"high"}
+	Model           string          `json:"model"`
+	Input           json.RawMessage `json:"input"` // string 或 [items]
+	Instructions    string          `json:"instructions"`
+	Tools           json.RawMessage `json:"tools"`
+	ToolChoice      json.RawMessage `json:"tool_choice"`
+	Stream          bool            `json:"stream"`
+	Reasoning       json.RawMessage `json:"reasoning"` // 可选: bool 或 {effort:"low"|"medium"|"high"}
+	MaxOutputTokens int             `json:"max_output_tokens"`
 }
 
 // handleResponses 处理 POST /v1/responses。
@@ -52,9 +53,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// 转换为内部格式
 	upReq := &upstream.ChatRequest{
-		Model:    s.model,
-		Stream:   true, // 内部统一用流式
-		Messages: []upstream.ChatMessage{},
+		Model:     s.model,
+		Stream:    true, // 内部统一用流式
+		Messages:  []upstream.ChatMessage{},
+		MaxTokens: req.MaxOutputTokens,
 	}
 
 	// reasoning → 推理等级/思考模式
