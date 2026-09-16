@@ -150,7 +150,7 @@ func Verify(cs *CSRF, timeout time.Duration) bool {
 	hc := newSessionClient(timeout)
 	defer hc.CloseIdleConnections()
 
-	body := `{"model":"deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"ping"}],"tools":[],"maxTokens":1}`
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"ping"}],"tools":[],"maxTokens":1}`
 	req, err := http.NewRequest(http.MethodPost, baseURL+chatPath, strings.NewReader(body))
 	if err != nil {
 		return false

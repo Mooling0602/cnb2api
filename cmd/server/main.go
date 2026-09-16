@@ -8,7 +8,7 @@
 //
 //	CNB2API_LISTEN  监听地址 (默认 :7863)
 //	CNB2API_API_KEY API 鉴权 key (默认空=不鉴权)
-//	CNB2API_MODEL   模型名 (默认 deepseek-v4-flash)
+//	CNB2API_MODEL   模型名 (默认 deepseek-v4.1-flash)
 //	CNB2API_POOL_MIN 凭证池最小数 (默认 2)
 //	CNB2API_POOL_MAX 凭证池最大数 (默认 8)
 package main
@@ -42,8 +42,8 @@ func defaultConfig() Config {
 	return Config{
 		Listen:   ":7863",
 		APIKey:   "",
-		Model:    "deepseek-v4-flash",
-		Models:   []string{"deepseek-v4-flash", "deepseek-v4-pro"},
+		Model:    "deepseek-v4.1-flash",
+		Models:   []string{"deepseek-v4.1-flash"},
 		Upstream: "https://cnb.cool",
 		PoolMin:  2,
 		PoolMax:  8,

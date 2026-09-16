@@ -8,7 +8,7 @@ import (
 func TestSanitizeUpstreamBody(t *testing.T) {
 	// 构造含 🇹🇼 的请求体
 	req := &ChatRequest{
-		Model:  "deepseek-v4-flash",
+		Model:  "deepseek-v4.1-flash",
 		Stream: true,
 		Messages: []ChatMessage{
 			{Role: "user", Content: "🇹🇼 的天气"},

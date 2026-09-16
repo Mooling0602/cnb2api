@@ -10,7 +10,7 @@
 //	  Origin/Referer: https://cnb.cool
 //	Body:
 //	  {
-//	    "model": "deepseek-v4-flash",
+//	    "model": "deepseek-v4.1-flash",
 //	    "stream": true,                 // 上游强制流式
 //	    "messages": [...],
 //	    "tools": [...],                 // 可选，NPC 自带工具

@@ -62,13 +62,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if len(req.Reasoning) > 0 {
 		reasoningEffort := extractResponsesReasoning(req.Reasoning)
 		if reasoningEffort != "" {
-			upReq.ReasoningEffort = &reasoningEffort
+			// off(大小写不敏感)→ 上游空串,即真正不触发思考链。
+			upReq.ReasoningEffort = reasoningEffortPtr(reasoningEffort)
 		}
 		enableThinking := true
 		upReq.EnableThinking = &enableThinking
 	} else {
-		effort := "low"
-		upReq.ReasoningEffort = &effort
+		upReq.ReasoningEffort = reasoningEffortPtr(reasoningDefault)
 	}
 
 	// 工具定义:统一提取 + 加 cnb_ 前缀(上游白名单要求),响应时还原。

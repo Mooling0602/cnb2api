@@ -75,14 +75,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if len(req.Reasoning) > 0 {
 		re := extractThinkingEffort(req.Reasoning)
 		if re != nil {
-			upReq.ReasoningEffort = re
+			upReq.ReasoningEffort = reasoningEffortPtr(*re)
 			enableThinking := true
 			upReq.EnableThinking = &enableThinking
 		}
 	} else {
 		// 默认思考:客户端未传 thinking 时,默认 low(最轻量)。
-		effort := "low"
-		upReq.ReasoningEffort = &effort
+		upReq.ReasoningEffort = reasoningEffortPtr(reasoningDefault)
 	}
 
 	// system 字段 → system message

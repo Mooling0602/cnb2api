@@ -157,15 +157,14 @@
 
             model = lib.mkOption {
               type = lib.types.str;
-              default = "deepseek-v4-flash";
+              default = "deepseek-v4.1-flash";
               description = "默认模型名。";
             };
 
             models = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               default = [
-                "deepseek-v4-flash"
-                "deepseek-v4-pro"
+                "deepseek-v4.1-flash"
               ];
               description = "对外暴露的模型列表。";
             };

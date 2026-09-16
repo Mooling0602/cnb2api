@@ -28,7 +28,7 @@ cp config.example.json config.json
 不写配置文件、仅用环境变量也能启动：
 
 ```bash
-CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4-flash \
+CNB2API_LISTEN=:7863 CNB2API_MODEL=deepseek-v4.1-flash \
 CNB2API_UPSTREAM=https://cnb.cool ./cnb2api
 ```
 
@@ -114,12 +114,12 @@ curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 # 对话（非流式）
 curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
 
 # 对话（流式）
 curl -N http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
+  -d '{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
 
 # 凭证池状态
 curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
@@ -136,8 +136,8 @@ curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
 {
   "listen": ":7863",                                  // 监听地址
   "api_key": "cnb-sk-...",                            // API 鉴权 key；留空 "" = 不鉴权
-  "model": "deepseek-v4-flash",                       // 默认模型
-  "models": ["deepseek-v4-flash", "deepseek-v4-pro"], // 支持的模型白名单（仅 JSON 可配）
+  "model": "deepseek-v4.1-flash",                       // 默认模型
+  "models": ["deepseek-v4.1-flash"],                    // 支持的模型白名单（仅 JSON 可配）
   "pool_min": 2,                                      // 凭证池最少常驻凭证数
   "pool_max": 8,                                      // 凭证池最大凭证数（≈并发上限）
   "ttl_minutes": 30,                                  // 凭证有效期（分钟）
@@ -149,7 +149,7 @@ curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
 
 - listen → CNB2API_LISTEN，默认 :7863
 - api_key → CNB2API_API_KEY，默认空（= 不鉴权）
-- model → CNB2API_MODEL，默认 deepseek-v4-flash
+- model → CNB2API_MODEL，默认 deepseek-v4.1-flash
 - pool_min → CNB2API_POOL_MIN，默认 2
 - pool_max → CNB2API_POOL_MAX，默认 8
 - ttl_minutes → CNB2API_TTL_MINUTES，默认 30

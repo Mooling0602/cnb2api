@@ -273,12 +273,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		upReq.TopP = req.TopP
 	}
 	if req.ReasoningEffort != nil {
-		upReq.ReasoningEffort = req.ReasoningEffort
+		// off(大小写不敏感)→ 上游空串,即真正不触发思考链。
+		upReq.ReasoningEffort = reasoningEffortPtr(*req.ReasoningEffort)
 	} else {
 		// 默认思考:客户端未指定 reasoning_effort 时,默认 low(最轻量)。
 		// 实测上游 enable_thinking=true 单独不触发思考链,必须用 reasoning_effort。
-		effort := "low"
-		upReq.ReasoningEffort = &effort
+		// 需要完全不思考时,客户端显式传 reasoning_effort=off(见 normalizeReasoningEffort)。
+		upReq.ReasoningEffort = reasoningEffortPtr(reasoningDefault)
 	}
 
 	// 工具定义:统一提取 + 加 cnb_ 前缀(上游白名单要求),响应时还原,客户端无感。
