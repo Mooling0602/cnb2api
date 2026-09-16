@@ -7,7 +7,7 @@
 构建：
 
 ```bash
-git clone https://github.com/Dreamwxz/cnb2api.git
+git clone https://github.com/Mooling0602/cnb2api.git
 cd cnb2api
 go build -o cnb2api ./cmd/server
 ```
@@ -37,6 +37,70 @@ Docker 部署（docker-compose.yml 已含健康检查）：
 ```bash
 docker compose up -d --build   # 宿主机 7863 -> 容器 7863
 ```
+
+## Nix / NixOS
+
+仓库自带 `flake.nix`（已启用 flakes），无需本机安装 Go：
+
+```bash
+# 直接运行（不传 -config 时走环境变量）
+CNB2API_API_KEY=your-key nix run .
+
+# 用配置文件运行
+nix run . -- -config ~/cnb2api.json
+
+# 构建二进制到 ./result/bin/cnb2api（cnb2api 是 server 的同义软链）
+nix build .#default
+./result/bin/cnb2api -config ~/cnb2api.json
+
+# 开发环境（go / gopls / golangci-lint）
+nix develop
+
+# 跑单元测试
+nix flake check
+```
+
+NixOS 上也可以声明式部署：
+
+```nix
+{
+  inputs.cnb2api.url = "github:Mooling0602/cnb2api";
+
+  # 在 NixOS 配置里
+  imports = [ inputs.cnb2api.nixosModules.default ];
+
+  services.cnb2api = {
+    enable = true;
+    listen = ":7863";
+    apiKeyFile = "/run/secrets/cnb2api-key"; # 纯文本 key 文件；不设 = 不鉴权
+    openFirewall = true;
+  };
+}
+```
+
+`apiKeyFile` 通过 systemd `LoadCredential` 注入，key 不会出现在 systemd 的 `Environment` 里。服务以 `DynamicUser` 运行，工作目录为 `/var/lib/cnb2api`。
+
+配合 sops-nix 时：
+
+```nix
+sops.secrets.cnb2api_key = { };              # 默认落在 /run/secrets/cnb2api_key
+systemd.services.cnb2api = {
+  after = [ "sops-install-secrets.service" ];
+  requires = [ "sops-install-secrets.service" ];
+};
+services.cnb2api.apiKeyFile = config.sops.secrets.cnb2api_key.path;
+```
+
+因为模块启用了 `ProtectHome`，key 文件不能放在 `/home` 或 `/root` 下（systemd 读不到），`/run/secrets` 这类位置没问题。
+
+### 支持的架构
+
+flake 声明支持 `x86_64-linux`、`aarch64-linux`、`aarch64-darwin`：
+
+- **在原生 aarch64 机器上**（ARM 服务器、树莓派、Asahi 等），`nix build .#default` 直接可用 —— nixpkgs 有预编译的 Go 工具链，`CGO_ENABLED=0` 产出静态二进制。
+- **从 x86_64 交叉构建 aarch64** 则需要在目标平台侧配置 `boot.binfmt.emulatedSystems = [ "aarch64-linux" ]`（或加远程 builder）。本仓库**没有**单独提供 `pkgsCross` 输出：交叉路径下 nixpkgs 需要从源码为本机编译 aarch64 的 glibc，没有 binfmt 会直接失败，而给一个"看起来能用其实装不上"的输出反而更坑。
+
+服务端代码本身无平台相关实现（无 build tag、无 cgo、无汇编、无 `syscall`/`unsafe`），aarch64 上不存在需要改代码的地方。
 
 验证是否可用：
 
