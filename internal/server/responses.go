@@ -147,7 +147,8 @@ func responsesInputToMessages(input json.RawMessage, renamer *toolconv.Renamer) 
 				role = "user"
 			}
 			content := responsesItemContent(item.Content)
-			out = append(out, upstream.ChatMessage{Role: role, Content: content})
+			parts := extractResponsesImages(item.Content)
+			out = append(out, upstream.ChatMessage{Role: role, Content: content, Parts: parts})
 		}
 	}
 	return out
@@ -337,11 +338,11 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 	created := map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
-			"id":         respID,
-			"object":     "response",
-			"model":      s.model,
-			"status":     "in_progress",
-			"output":     []any{},
+			"id":          respID,
+			"object":      "response",
+			"model":       s.model,
+			"status":      "in_progress",
+			"output":      []any{},
 			"output_text": "",
 		},
 	}
@@ -438,10 +439,10 @@ func (s *Server) responsesStreamResponse(w http.ResponseWriter, resp *http.Respo
 						"type":         "response.output_item.added",
 						"output_index": textIndex,
 						"item": map[string]any{
-							"type":    "message",
-							"id":      textItemID,
-							"role":    "assistant",
-							"status":  "in_progress",
+							"type":   "message",
+							"id":     textItemID,
+							"role":   "assistant",
+							"status": "in_progress",
 							"content": []map[string]any{
 								{"type": "output_text", "text": "", "annotations": []any{}},
 							},

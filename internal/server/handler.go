@@ -165,6 +165,8 @@ type chatMsg struct {
 
 // extractChatContent 兼容 content 为 string 或数组(多模态)两种格式,提取纯文本。
 // 支持 OpenAI 标准(text/image_url)与 openclaw 自定义(thinking/toolCall/toolResult)格式。
+// 注意:图片块由 extractChatImages 另行提取并透传给上游(上游支持视觉输入),
+// 不在这里转成文本,否则 base64 会被当成正文导致模型幻觉。
 func extractChatContent(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
@@ -181,7 +183,7 @@ func extractChatContent(raw json.RawMessage) string {
 		Thinking  string `json:"thinking"`
 		Name      string `json:"name"`
 		Arguments any    `json:"arguments"`
-		// image_url 等其它类型忽略(CNB 不支持多模态)
+		// image_url 在这里跳过,由 extractChatImages 单独处理
 	}
 	if err := json.Unmarshal(raw, &parts); err == nil {
 		var sb strings.Builder
@@ -303,19 +305,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	nativeTools := len(req.Tools) > 0
 	msgsToProcess := req.Messages
 	var converted []upstream.ChatMessage
-	appendUser := func(content string) {
-		if len(converted) > 0 && converted[len(converted)-1].Role == "user" {
+	// appendUser 追加/合并 user 消息。parts 为该消息携带的图片等非文本块;
+	// 仅当合并目标也没有图片时才做文本合并,否则拆成独立消息,避免把
+	// 图片挤到不相干的历史文本后面导致语义错位。
+	appendUser := func(content string, parts []upstream.ContentPart) {
+		if len(parts) == 0 && len(converted) > 0 && converted[len(converted)-1].Role == "user" && !converted[len(converted)-1].HasImage() {
 			// 合并到上一条 user
 			if converted[len(converted)-1].Content != "" {
 				converted[len(converted)-1].Content += "\n\n"
 			}
 			converted[len(converted)-1].Content += content
-		} else {
-			converted = append(converted, upstream.ChatMessage{Role: "user", Content: content})
+			return
 		}
+		converted = append(converted, upstream.ChatMessage{Role: "user", Content: content, Parts: parts})
 	}
 	for _, m := range msgsToProcess {
 		content := extractChatContent(m.Content)
+		parts := extractChatImages(m.Content)
 		role := m.Role
 		// 过滤: 失败的 assistant 占位(无实际内容且无工具调用)
 		if role == "assistant" && (strings.Contains(content, "[assistant turn failed") || strings.Contains(content, "turn failed before producing")) {
@@ -323,27 +329,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		// openclaw 自定义角色 toolResult(工具执行结果),上游不认,转 user 并合并
 		if role == "toolResult" {
-			if content == "" {
+			if content == "" && len(parts) == 0 {
 				content = "(tool result)"
 			}
-			appendUser("[工具执行结果] " + content)
+			if len(parts) > 0 {
+				converted = append(converted, upstream.ChatMessage{Role: "user", Content: "[工具执行结果] " + content, Parts: parts})
+			} else {
+				appendUser("[工具执行结果] "+content, nil)
+			}
 			continue
 		}
 		// tool 角色:原生闭环时透传 tool_call_id,否则降级为 user
 		if role == "tool" {
-			if content == "" {
+			if content == "" && len(parts) == 0 {
 				content = "(tool result)"
 			}
 			if nativeTools {
-				converted = append(converted, upstream.ChatMessage{Role: "tool", Content: content, ToolCallID: m.ToolCallID})
+				converted = append(converted, upstream.ChatMessage{Role: "tool", Content: content, Parts: parts, ToolCallID: m.ToolCallID})
+			} else if len(parts) > 0 {
+				converted = append(converted, upstream.ChatMessage{Role: "user", Content: "[工具执行结果] " + content, Parts: parts})
 			} else {
-				appendUser("[工具执行结果] " + content)
+				appendUser("[工具执行结果] "+content, nil)
 			}
 			continue
 		}
 		// user 消息:如果上一条是 user 也合并(连续 user)
 		if role == "user" {
-			appendUser(content)
+			appendUser(content, parts)
 			continue
 		}
 		// assistant 带 tool_calls 的消息:原生透传(content 为 null 保持空字符串)
@@ -359,15 +371,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// assistant 空 content(工具调用后)→ 说明文本(仅旧降级路径)
-		if role == "assistant" && content == "" {
+		if role == "assistant" && content == "" && len(parts) == 0 {
 			content = "(assistant called tools)"
 		}
-		converted = append(converted, upstream.ChatMessage{Role: role, Content: content})
+		converted = append(converted, upstream.ChatMessage{Role: role, Content: content, Parts: parts})
 	}
 	// 清理空消息和尾部空 user
+	// 注意:带图片的消息即使文本为空也必须保留(纯图消息是合法的)。
 	var cleaned []upstream.ChatMessage
 	for _, c := range converted {
-		if c.Content == "" && c.Role == "user" {
+		if c.Content == "" && c.Role == "user" && !c.HasImage() {
 			continue
 		}
 
@@ -386,12 +399,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	{
 		roleCounts := map[string]int{}
 		totalLen := 0
+		imgCount := 0
 		for _, m := range upReq.Messages {
 			roleCounts[m.Role]++
 			totalLen += len(m.Content)
+			imgCount += len(m.Parts)
 		}
-		log.Printf("[FWD] model=%s msgs=%d totalChars=%d roles=%v lastRole=%s lastContentLen=%d maxTokens=%d",
-			req.Model, len(upReq.Messages), totalLen, roleCounts,
+		log.Printf("[FWD] model=%s msgs=%d totalChars=%d images=%d roles=%v lastRole=%s lastContentLen=%d maxTokens=%d",
+			req.Model, len(upReq.Messages), totalLen, imgCount, roleCounts,
 			upReq.Messages[len(upReq.Messages)-1].Role,
 			len(upReq.Messages[len(upReq.Messages)-1].Content), upReq.MaxTokens)
 	}

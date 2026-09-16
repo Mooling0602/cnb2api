@@ -58,12 +58,61 @@ type ChatRequest struct {
 }
 
 // ChatMessage 是聊天消息。
+//
+// Content 为纯文本;需要携带图片时,把图片放进 Parts,序列化时会自动
+// 展开成 OpenAI 多模态 content 数组(见 MarshalJSON)。
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 消息的工具调用
-	ToolCallID string     `json:"tool_call_id,omitempty"` // tool 消息对应的调用 ID
+	Role       string        `json:"role"`
+	Content    string        `json:"content"`
+	Parts      []ContentPart `json:"-"`                      // 图片等非文本块,非空时 content 输出为数组
+	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`   // assistant 消息的工具调用
+	ToolCallID string        `json:"tool_call_id,omitempty"` // tool 消息对应的调用 ID
 }
+
+// ContentPart 是多模态 content 数组里的一个块。
+// 文本块由 ChatMessage.Content 自动生成,这里只显式承载图片。
+type ContentPart struct {
+	Type     string    `json:"type"`                // "text" | "image_url"
+	Text     string    `json:"text,omitempty"`      // Type=="text" 时有效
+	ImageURL *ImageURL `json:"image_url,omitempty"` // Type=="image_url" 时有效
+}
+
+// ImageURL 是 image_url 块的内容。
+// 上游只接受 data URL(base64 内联),远程 http(s) 地址会被上游 400 拒绝。
+type ImageURL struct {
+	URL string `json:"url"`
+}
+
+// MarshalJSON 在带图片时把 content 输出为多模态数组,否则保持字符串。
+//
+// 上游实测:content 既接受纯字符串,也接受 [{type:text},{type:image_url}] 数组;
+// 只有图片没有文本(如 [{type:image_url}])同样可用。
+func (m ChatMessage) MarshalJSON() ([]byte, error) {
+	type wireMessage struct {
+		Role       string     `json:"role"`
+		Content    any        `json:"content"`
+		ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+	}
+	var content any = m.Content
+	if len(m.Parts) > 0 {
+		parts := make([]ContentPart, 0, len(m.Parts)+1)
+		if m.Content != "" {
+			parts = append(parts, ContentPart{Type: "text", Text: m.Content})
+		}
+		parts = append(parts, m.Parts...)
+		content = parts
+	}
+	return json.Marshal(wireMessage{
+		Role:       m.Role,
+		Content:    content,
+		ToolCalls:  m.ToolCalls,
+		ToolCallID: m.ToolCallID,
+	})
+}
+
+// HasImage 报告该消息是否携带图片。
+func (m ChatMessage) HasImage() bool { return len(m.Parts) > 0 }
 
 // ToolCall 是 assistant 消息里的工具调用（OpenAI 标准格式）。
 // 注意:function.arguments 是 JSON 字符串,与工具定义里的 parameters(map)不同。

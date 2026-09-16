@@ -125,6 +125,34 @@ curl -N http://localhost:7863/v1/chat/completions \
 curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
 ```
 
+### 图片输入（视觉）
+
+上游模型支持图片理解。三种协议的图片都会被转换成上游接受的 `image_url` 块转发：
+
+| 协议 | 客户端传法 |
+|---|---|
+| OpenAI Chat | `content: [{type:"text",...},{type:"image_url",image_url:{url:"data:image/png;base64,..."}}]` |
+| Anthropic | `content: [{type:"text",...},{type:"image",source:{type:"base64",media_type:"image/png",data:"..."}}]` |
+| OpenAI Responses | `content: [{type:"input_text",...},{type:"input_image",image_url:"data:image/png;base64,..."}]` |
+
+cURL 示例（Chat 协议，`$B64` 为图片的 base64）：
+
+```bash
+curl -N http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","stream":true,"max_tokens":2000,"messages":[
+        {"role":"user","content":[
+          {"type":"text","text":"这张图是什么颜色？"},
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,'"$B64"'"}}]}]}'
+```
+
+注意事项：
+
+- **图片必须内联为 data URL**（base64）。远程 `http(s)` 地址会被上游以 400 拒绝（`code 11133`），网关不做代下载 —— 那会引入 SSRF 与体积膨胀风险。
+- 图片可出现在 `user` / `system` / `assistant` / `tool` 任一角色，单条消息可带多张图。
+- 上游接受的 mime：`image/png`、`image/jpeg`、`image/jpg`、`image/gif`、`image/webp`（大小写、`;charset=...` 后缀、首尾空格均容忍）；`image/bmp`、`image/svg+xml` 会被拒。网关不预校验 mime，由上游裁决，避免上游放宽后网关结论过期。
+- **给足 `max_tokens`**：图片会显著拉长思考链。若额度太小，思考过程会把配额耗尽，导致 `content` 为空 —— 这是输出被截断，不是图片没传过去。需要立刻拿到答案可显式传 `reasoning_effort: "off"`。
+
 鉴权说明：除根路径 `/`（免鉴权存活探测，返回 200 OK）外，其余所有端点统一鉴权（同时支持 OpenAI `Authorization: Bearer` 与 Anthropic `x-api-key`）；业务接口同时支持 /v1/... 与 /... 两种路径。Docker healthcheck 探测 `/` 即可，无需携带 key。
 
 ## 配置说明
@@ -157,3 +185,13 @@ curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
 - models 无环境变量，只能写在 JSON 里
 
 > 若请求的模型不在 models 白名单内，会静默回退到默认的 model。
+
+## 原项目与许可说明
+
+原项目位于 https://github.com/lwjlwjlwjlwj/cnb2api
+
+本仓库增加了推理等级、图片输入支持，并将内置的模型 ID 同步到上游已更新的 deepseek-v4.1-flash。
+
+协议使用 MIT，与原项目相同。
+
+**注意**：本项目仅供学习参考使用，请勿在生产环境下部署，请勿滥用于违法违规活动！上游接口可能随时进行调整和变动，本项目不对兼容和支持这些变更做任何保证。

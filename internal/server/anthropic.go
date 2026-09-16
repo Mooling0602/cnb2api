@@ -108,6 +108,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		switch m.Role {
 		case "assistant":
 			calls, text := toolconv.AnthropicCalls(blocks)
+			parts := extractAnthropicImages(m.Content)
 			if len(calls) > 0 {
 				upCalls := make([]upstream.ToolCall, 0, len(calls))
 				for _, c := range calls {
@@ -120,24 +121,26 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 						},
 					})
 				}
-				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text, ToolCalls: upCalls})
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text, Parts: parts, ToolCalls: upCalls})
 			} else {
-				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text})
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "assistant", Content: text, Parts: parts})
 			}
 		case "user":
 			results, text := toolconv.AnthropicResults(blocks)
+			parts := extractAnthropicImages(m.Content)
 			if len(results) > 0 {
 				for _, res := range results {
 					upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "tool", Content: res.Content, ToolCallID: res.CallID})
 				}
-				if text != "" {
-					upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text})
+				// text 为空但有图片时同样要发,否则纯图消息会被丢掉。
+				if text != "" || len(parts) > 0 {
+					upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text, Parts: parts})
 				}
 			} else {
-				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text})
+				upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: "user", Content: text, Parts: parts})
 			}
 		default:
-			upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: m.Role, Content: extractAnthropicText(m.Content)})
+			upReq.Messages = append(upReq.Messages, upstream.ChatMessage{Role: m.Role, Content: extractAnthropicText(m.Content), Parts: extractAnthropicImages(m.Content)})
 		}
 	}
 
