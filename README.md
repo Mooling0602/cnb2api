@@ -2,7 +2,35 @@
 
 > 用 Go 实现的、把 CNB（cnb.cool）NPC 聊天接口封装成 OpenAI / Anthropic 兼容 API 的免登录反向代理网关。
 
-## 使用方法
+零第三方依赖，编译产物为单个二进制。
+
+## 功能特性
+
+**三种客户端协议**，全部翻译到上游的 OpenAI Chat 格式：
+
+| 协议 | 端点 |
+|---|---|
+| OpenAI Chat Completions | `/v1/chat/completions` |
+| Anthropic Messages | `/v1/messages`（另兼容 `/anthropic/v1/messages`） |
+| OpenAI Responses | `/v1/responses` |
+
+所有业务端点**同时支持带 `/v1` 前缀与不带前缀**两种路径，方便各类 SDK 把 `base_url` 配成根路径或 `/v1`。
+
+**图片输入（视觉）**：三种协议的图片都会被归一化并转发给上游，支持多图、多轮、任意消息角色。
+
+**推理等级**：通过 `reasoning_effort` 控制思考深度，三个协议均支持（Anthropic 的 `thinking.budget_tokens`、Responses 的 `reasoning.effort` 会被自动映射）。默认注入最轻量的 `low`；传 `reasoning_effort: "off"` 可完全关闭思考。
+
+**原生工具调用（function calling）**：三个协议都支持，网关自动处理上游的工具名前缀要求，客户端无感。
+
+**凭证池**：自动从上游首页获取并轮换匿名凭证，带 TTL 与失效重试，无需任何账号或 key。`pool_max` 即并发上限。
+
+**免鉴权存活探测**：根路径 `/` 返回 200 OK，可直接用于 Docker healthcheck。
+
+> ⚠️ 上游对**请求体有 1 MiB 硬上限**，而 base64 图片会膨胀约 33%、且每轮都会重发整个历史。
+> 单张图建议不超过 ~700 KB。超限时会返回明确的 **HTTP 413**（含 `body_bytes` / `limit_bytes`）。
+> 详见 [AGENTS.md](AGENTS.md#27-请求体-1-mib-硬上限重要)。
+
+## 快速开始
 
 构建：
 
@@ -38,6 +66,40 @@ Docker 部署（docker-compose.yml 已含健康检查）：
 docker compose up -d --build   # 宿主机 7863 -> 容器 7863
 ```
 
+验证是否可用：
+
+```bash
+# 存活探测（免鉴权，返回 200 OK）
+curl -s http://localhost:7863/
+
+# 模型列表
+curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
+
+# 对话（非流式）
+curl -s http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
+
+# 对话（流式）
+curl -N http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
+
+# 图片输入（$B64 为图片的 base64）
+curl -N http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","stream":true,"max_tokens":2000,"messages":[
+        {"role":"user","content":[
+          {"type":"text","text":"这张图是什么颜色？"},
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,'"$B64"'"}}]}]}'
+
+# 凭证池状态
+curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
+```
+
+> 图片必须**内联为 data URL（base64）**，远程 `http(s)` 地址会被上游拒绝。
+> 给图片请求留足 `max_tokens`：图片会显著拉长思考链，额度太小会导致 `content` 为空（输出被截断）。
+
 ## Nix / NixOS
 
 仓库自带 `flake.nix`（已启用 flakes），无需本机安装 Go：
@@ -59,6 +121,8 @@ nix develop
 # 跑单元测试
 nix flake check
 ```
+
+`nix run .` 会在源码变化时自动重新编译；注意 flake 取的是 **Git 树**，新增文件需要先 `git add`（不必 commit）。
 
 NixOS 上也可以声明式部署：
 
@@ -97,63 +161,26 @@ services.cnb2api.apiKeyFile = config.sops.secrets.cnb2api_key.path;
 
 flake 声明支持 `x86_64-linux`、`aarch64-linux`、`aarch64-darwin`：
 
-- **在原生 aarch64 机器上**（ARM 服务器、树莓派、Asahi 等），`nix build .#default` 直接可用 —— nixpkgs 有预编译的 Go 工具链，`CGO_ENABLED=0` 产出静态二进制。
-- **从 x86_64 交叉构建 aarch64** 则需要在目标平台侧配置 `boot.binfmt.emulatedSystems = [ "aarch64-linux" ]`（或加远程 builder）。本仓库**没有**单独提供 `pkgsCross` 输出：交叉路径下 nixpkgs 需要从源码为本机编译 aarch64 的 glibc，没有 binfmt 会直接失败，而给一个"看起来能用其实装不上"的输出反而更坑。
+- **在原生 aarch64 机器上**（ARM 服务器、树莓派、Asahi 等），`nix build .#default` 直接可用。服务端代码本身无平台相关实现，aarch64 上不存在需要改代码的地方。
+- **从 x86_64 交叉构建 aarch64** 需要在目标平台侧配置 `boot.binfmt.emulatedSystems = [ "aarch64-linux" ]`（或加远程 builder）。本仓库**没有**单独提供 `pkgsCross` 输出，原因见 [AGENTS.md](AGENTS.md#53-架构支持)。
 
-服务端代码本身无平台相关实现（无 build tag、无 cgo、无汇编、无 `syscall`/`unsafe`），aarch64 上不存在需要改代码的地方。
+## 鉴权说明
 
-验证是否可用：
+除根路径 `/`（免鉴权存活探测，返回 200 OK）外，其余所有端点统一鉴权，同时支持 OpenAI 的 `Authorization: Bearer` 与 Anthropic 的 `x-api-key`。Docker healthcheck 探测 `/` 即可，无需携带 key。
 
-```bash
-# 存活探测（免鉴权，返回 200 OK）
-curl -s http://localhost:7863/
+## 端点一览
 
-# 模型列表
-curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
-
-# 对话（非流式）
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
-
-# 对话（流式）
-curl -N http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
-
-# 凭证池状态
-curl -s http://localhost:7863/pool -H "Authorization: Bearer your-api-key"
-```
-
-### 图片输入（视觉）
-
-上游模型支持图片理解。三种协议的图片都会被转换成上游接受的 `image_url` 块转发：
-
-| 协议 | 客户端传法 |
+| 路径 | 说明 |
 |---|---|
-| OpenAI Chat | `content: [{type:"text",...},{type:"image_url",image_url:{url:"data:image/png;base64,..."}}]` |
-| Anthropic | `content: [{type:"text",...},{type:"image",source:{type:"base64",media_type:"image/png",data:"..."}}]` |
-| OpenAI Responses | `content: [{type:"input_text",...},{type:"input_image",image_url:"data:image/png;base64,..."}]` |
+| `GET /` | 免鉴权存活探测 |
+| `GET /v1/models` | 模型列表（按配置白名单生成） |
+| `POST /v1/chat/completions` | OpenAI Chat 协议 |
+| `POST /v1/messages` | Anthropic Messages 协议 |
+| `POST /v1/messages/count_tokens` | Anthropic token 计数 |
+| `POST /v1/responses` | OpenAI Responses 协议 |
+| `GET /v1/pool` | 凭证池状态 |
 
-cURL 示例（Chat 协议，`$B64` 为图片的 base64）：
-
-```bash
-curl -N http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","stream":true,"max_tokens":2000,"messages":[
-        {"role":"user","content":[
-          {"type":"text","text":"这张图是什么颜色？"},
-          {"type":"image_url","image_url":{"url":"data:image/png;base64,'"$B64"'"}}]}]}'
-```
-
-注意事项：
-
-- **图片必须内联为 data URL**（base64）。远程 `http(s)` 地址会被上游以 400 拒绝（`code 11133`），网关不做代下载 —— 那会引入 SSRF 与体积膨胀风险。
-- 图片可出现在 `user` / `system` / `assistant` / `tool` 任一角色，单条消息可带多张图。
-- 上游接受的 mime：`image/png`、`image/jpeg`、`image/jpg`、`image/gif`、`image/webp`（大小写、`;charset=...` 后缀、首尾空格均容忍）；`image/bmp`、`image/svg+xml` 会被拒。网关不预校验 mime，由上游裁决，避免上游放宽后网关结论过期。
-- **给足 `max_tokens`**：图片会显著拉长思考链。若额度太小，思考过程会把配额耗尽，导致 `content` 为空 —— 这是输出被截断，不是图片没传过去。需要立刻拿到答案可显式传 `reasoning_effort: "off"`。
-
-鉴权说明：除根路径 `/`（免鉴权存活探测，返回 200 OK）外，其余所有端点统一鉴权（同时支持 OpenAI `Authorization: Bearer` 与 Anthropic `x-api-key`）；业务接口同时支持 /v1/... 与 /... 两种路径。Docker healthcheck 探测 `/` 即可，无需携带 key。
+以上业务端点均同时支持不带 `/v1` 前缀的形式。
 
 ## 配置说明
 
@@ -164,8 +191,8 @@ curl -N http://localhost:7863/v1/chat/completions \
 {
   "listen": ":7863",                                  // 监听地址
   "api_key": "cnb-sk-...",                            // API 鉴权 key；留空 "" = 不鉴权
-  "model": "deepseek-v4.1-flash",                       // 默认模型
-  "models": ["deepseek-v4.1-flash"],                    // 支持的模型白名单（仅 JSON 可配）
+  "model": "deepseek-v4.1-flash",                     // 默认模型
+  "models": ["deepseek-v4.1-flash"],                  // 支持的模型白名单（仅 JSON 可配）
   "pool_min": 2,                                      // 凭证池最少常驻凭证数
   "pool_max": 8,                                      // 凭证池最大凭证数（≈并发上限）
   "ttl_minutes": 30,                                  // 凭证有效期（分钟）
@@ -185,6 +212,16 @@ curl -N http://localhost:7863/v1/chat/completions \
 - models 无环境变量，只能写在 JSON 里
 
 > 若请求的模型不在 models 白名单内，会静默回退到默认的 model。
+
+## 开发
+
+```bash
+go build ./... && go vet ./... && go test ./...
+nix flake check     # 含 go test ./...
+```
+
+面向贡献者与 AI Agent 的技术说明见 **[AGENTS.md](AGENTS.md)**：上游协议的实测结论、
+图片与体积上限细节、Nix 构建注意事项、以及提交信息与注释规范。
 
 ## 原项目与许可说明
 

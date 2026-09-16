@@ -418,7 +418,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if werr := os.WriteFile("/tmp/cnb2api_last_req.json", body, 0o644); werr == nil {
 			log.Printf("[ERR] upstream rejected request, body saved (%d bytes): %v", len(body), err)
 		}
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
+		writeUpstreamError(w, err)
 		return
 	}
 	defer resp.Body.Close()

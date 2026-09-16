@@ -161,9 +161,49 @@ func NewClient(pool *auth.Pool, timeout time.Duration) *Client {
 	}
 }
 
+// MaxBodyBytes 是上游 CNB 外层网关的请求体硬上限。
+//
+// 实测二分定位:1048112 字节通过,1048688 字节返回
+// {"errcode":413,"errmsg":"[BODY_TOO_LARGE]Request body too large"}。
+// 注意该限制来自外层网关(错误格式为 errcode/errmsg),请求根本不会到达模型;
+// 上游也不支持 Content-Encoding: gzip 绕过(实测返回 500)。
+//
+// 该常量仅用于诊断文案与体积预检提示,不作为拦截依据:是否超限始终由上游裁决,
+// 避免上游放宽限制后网关仍按旧值拒绝请求。
+const MaxBodyBytes = 1 << 20 // 1 MiB
+
+// ErrBodyTooLarge 表示请求体超过上游网关上限,请求未送达模型。
+//
+// 这是客户端侧问题(与上游故障无关),网关据此返回 413 而非 502,
+// 并附上实际体积与可操作建议。
+type ErrBodyTooLarge struct {
+	Size  int    // 实际请求体字节数
+	Limit int    // 上游上限
+	Raw   string // 上游原始响应
+}
+
+func (e *ErrBodyTooLarge) Error() string {
+	return fmt.Sprintf("cnb: request body too large: %d bytes exceeds upstream limit %d bytes (1 MiB); "+
+		"the upstream gateway rejected the request before it reached the model", e.Size, e.Limit)
+}
+
 // Chat 向 CNB 发送聊天请求，返回 SSE 流。调用方负责关闭 resp.Body。
 // 请求成功(2xx)时返回 resp，resp.Body 关闭时自动归还凭证；遇凭证失效(401/403)会尝试换凭证重试。
 func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*http.Response, error) {
+	// 强制流式（上游拒绝非流式）
+	req.Stream = true
+
+	// 序列化一次即可:请求体在重试之间不变,而图片内联后体积可观,
+	// 放在循环内会在每次换凭证重试时重复序列化。
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	// 内容清洗:上游 CNB 对特定 emoji(如台湾国旗 tw)触发 500 Internal Server Error
+	// (实测任何消息角色 user/system/tool 均触发,属上游内容审核 bug)。
+	// 网关在最后一公里做等价替换,规避上游 bug,非内容审查。
+	body = sanitizeUpstreamBody(body)
+
 	// 最多重试 3 次（换凭证）
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -172,7 +212,7 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*http.Response, er
 			return nil, err
 		}
 
-		resp, err := c.doChat(ctx, cs, req)
+		resp, err := c.doChat(ctx, cs, body)
 		if err != nil {
 			c.csrfPool.Report(cs, false)
 			lastErr = err
@@ -185,9 +225,9 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*http.Response, er
 			return resp, nil
 		case http.StatusUnauthorized, http.StatusForbidden:
 			// 读取响应体判断是否为 CSRF 失效（可重试）还是业务拒绝（不可重试）
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			s := string(body)
+			s := string(raw)
 			if isCSRFError(s) {
 				// 凭证失效，标记并重试
 				c.csrfPool.Report(cs, false)
@@ -197,11 +237,20 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*http.Response, er
 			// 业务拒绝（如 Agent calls not allowed）：不重试，直接透传
 			c.csrfPool.Report(cs, true) // 凭证本身有效，不消耗错误计数
 			return nil, fmt.Errorf("cnb: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(s))
-		default:
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		case http.StatusRequestEntityTooLarge:
+			// 体积超限:重试无意义(同一具请求体必然再次被拒),立即返回可诊断的错误。
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			lastErr = fmt.Errorf("cnb: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-			return nil, lastErr
+			// 凭证本身有效,不消耗错误计数,并且必须归还 inUse,否则反复触发会撑爆凭证池。
+			c.csrfPool.Report(cs, true)
+			return nil, &ErrBodyTooLarge{Size: len(body), Limit: MaxBodyBytes, Raw: strings.TrimSpace(string(raw))}
+		default:
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			// 归还凭证:该分支的错误来自客户端请求本身(参数/体积等),与凭证有效性无关。
+			// 漏掉这次 Report 会让 inUse 计数永久泄漏,凭证池随失败次数不断膨胀。
+			c.csrfPool.Report(cs, true)
+			return nil, fmt.Errorf("cnb: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 		}
 	}
 	return nil, fmt.Errorf("cnb: chat failed after retries: %w", lastErr)
@@ -228,20 +277,8 @@ func (r *reportCloser) Close() error {
 	return err
 }
 
-// doChat 执行单次请求。
-func (c *Client) doChat(ctx context.Context, cs *auth.CSRF, req *ChatRequest) (*http.Response, error) {
-	// 强制流式（上游拒绝非流式）
-	req.Stream = true
-
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	// 内容清洗:上游 CNB 对特定 emoji(如台湾国旗 🇹🇼)触发 500 Internal Server Error
-	// (实测任何消息角色 user/system/tool 均触发,属上游内容审核 bug)。
-	// 网关在最后一公里做等价替换,规避上游 bug,非内容审查。
-	body = sanitizeUpstreamBody(body)
-
+// doChat 执行单次请求。body 为已序列化并清洗过的请求体(由 Chat 复用)。
+func (c *Client) doChat(ctx context.Context, cs *auth.CSRF, body []byte) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err

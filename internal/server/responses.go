@@ -90,7 +90,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp, err := s.upstream.Chat(ctx, upReq)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
+		writeUpstreamError(w, err)
 		return
 	}
 	defer resp.Body.Close()
